@@ -35,7 +35,7 @@ fn platform_soup() -> TriangleSoup {
 }
 
 fn idle() -> MoveInput {
-    MoveInput { vel_xy: [0.0, 0.0], jump: false, drop: false }
+    MoveInput { vel_xy: [0.0, 0.0], jump: false, drop: false, pole_move: [0.0, 0.0] }
 }
 
 #[test]
@@ -44,7 +44,7 @@ fn ledge_grab_shimmy_climb_drop() {
     // Airborne beside the wall, moving toward it (+Y).
     let mut ctl = Controller::new([0.0, -70.0, -60.0]);
     let dt = 1.0 / 60.0;
-    let toward = MoveInput { vel_xy: [0.0, 150.0], jump: false, drop: false };
+    let toward = MoveInput { vel_xy: [0.0, 150.0], jump: false, drop: false, pole_move: [0.0, 0.0] };
     let mut grabbed = false;
     for _ in 0..30 {
         ctl.step(&soup, &toward, dt);
@@ -59,7 +59,7 @@ fn ledge_grab_shimmy_climb_drop() {
 
     // Shimmy +X along the wall.
     let x0 = ctl.pos[0];
-    let shimmy = MoveInput { vel_xy: [150.0, 0.0], jump: false, drop: false };
+    let shimmy = MoveInput { vel_xy: [150.0, 0.0], jump: false, drop: false, pole_move: [0.0, 0.0] };
     for _ in 0..30 {
         ctl.step(&soup, &shimmy, dt);
     }
@@ -68,7 +68,7 @@ fn ledge_grab_shimmy_climb_drop() {
     assert!((ctl.pos[2] - (100.0 - HANG_DROP)).abs() < 2.0, "hang height kept");
 
     // Climb up: ends standing on the platform.
-    let climb = MoveInput { vel_xy: [0.0, 0.0], jump: true, drop: false };
+    let climb = MoveInput { vel_xy: [0.0, 0.0], jump: true, drop: false, pole_move: [0.0, 0.0] };
     ctl.step(&soup, &climb, dt);
     assert!(ctl.hanging.map(|h| h.climbing > 0.0).unwrap_or(false), "climb started");
     for _ in 0..40 {
@@ -88,7 +88,7 @@ fn ledge_grab_shimmy_climb_drop() {
         }
     }
     assert!(ctl2.hanging.is_some());
-    let drop = MoveInput { vel_xy: [0.0, 0.0], jump: false, drop: true };
+    let drop = MoveInput { vel_xy: [0.0, 0.0], jump: false, drop: true, pole_move: [0.0, 0.0] };
     ctl2.step(&soup, &drop, dt);
     assert!(ctl2.hanging.is_none(), "released");
     let z0 = ctl2.pos[2];
@@ -167,7 +167,7 @@ fn beam_walk_centerline_and_end_fall() {
 
     // Walk along +Y with a constant sideways push: the
     // centerline lock absorbs the lateral input.
-    let walk = MoveInput { vel_xy: [25.0, 150.0], jump: false, drop: false };
+    let walk = MoveInput { vel_xy: [25.0, 150.0], jump: false, drop: false, pole_move: [0.0, 0.0] };
     for _ in 0..60 {
         ctl.step(&soup, &walk, dt);
     }

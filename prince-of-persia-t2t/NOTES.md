@@ -761,3 +761,39 @@ clip was wired rather than fake it; the state plays the
 grounded placeholder until the base locomotion gap
 closes. Column spin clip identified (0x4e001797) for a
 future pole state.
+
+## Addendum 2026-10-23 (combat slice)
+Combat shipped in t2t_game: src/combat.rs (Fighter/StrikeProfile, 3 unit tests); the Prince (F / right-mouse) swings the SpeedKill spin slash 0x4e001719, reels with AMIR knockback 0x970005d0; the Sand Garde (own rig + bank, guest-loaded) approaches on the controller, pounces (0x6c000506), takes knockdown-rise hits (0xa20008ca), dies with 0xa2000ac3; HUD shows both HP; player death respawns both. Verified live on this VM: enemy spawns on the Prince's floor 242 units away in Quai, fight loop ran to two Prince deaths + respawns in one 38 s capture (out/evidence/prince_fight_video.mp4 + prince_fight_screenshot.png). Placement lesson: assembled sectors have sparse walkable floors — placement must search from the player's LANDING floor (anchor fallback gz is the AABB top). Player-side hits on the enemy are unit-tested (no key injection on this VM to demo his swing live).
+
+## Addendum 2026-10-23 (pole state)
+Pole traversal shipped: collision::find_pole (ray-ring detector, see FORMATS.md), controller PoleState (grab/climb/orbit/leap/step-off), t2t_game wiring with the verified Column-bank clips (grip 0x4e00178a, climb 0x4e001784, spin 0x4e001796) at animation priority below combat, above hang. Two detector designs were falsified on real data before the ray approach worked: centroid clustering (real meshes too coarse) and a 5-of-8 ring threshold (face points reach 5 via corner hits). Sector census found no climbable column in Quai / Central Garden / Inner Garden / Tower P01 — pole ships synthetic-verified (tests/pole_real.rs, 2 tests) and will engage wherever a real column exists.
+
+## Addendum 2026-10-23 (second enemy: Human Guard; multi-enemy roster)
+The Human Guard joined the Quai fight. His bank (ACT_Enemy_HumanGarde) is self-contained (rig + clips) like the Sand Garde's, and the shared pool clips play coherently on B_HG (pose-matched against the SG reference strips). t2t_game now runs a roster: Vec<EnemySpec>/EnemyChar+idx, per-enemy placement with 180-unit separation, per-enemy AI in the one system, HUD listing all pools, whole-roster reset on player death. Live capture: duo fight in Quai, three Prince deaths in a run (out/evidence/prince_fight_duo_*). Soldier caveat stands: pool contorts on his rig — a soldier enemy needs his own 6d-family set surveyed first.
+
+## Addendum 2026-10-23 (Babylonian Soldier via name-based channel map)
+The soldier blocker was a bone-ORDER difference, not a format wall: same Bip names, different GAO order (arms before legs; no skirt bones). ChannelMap::from_bone_names (skin.rs) pairs clip channels to bones by normalized Bip name — 34/46 channels pair — and the shared pool then plays on B_BabylonSoldier pose-for-pose. He joins the Quai roster (rig from 100_Quai, clips from ACT_Enemy_SandGarde, map_from the SG rig). Live trio capture: 5 Prince deaths in one run (out/evidence/prince_fight_trio_*). The same trick should generalize to other Bip-ordered rigs (archers, Thrall, etc. — 17 ACT_Enemy banks exist).
+
+## Addendum 2026-10-23 (ALL banks resolved from the name map)
+Per the user's directive, the name-map resolution ran over every ACT_Enemy bank (resolve_banks census, strips in t2t-bevy/out/resolve/). Resolved + rostered: SandGateGarde (42/46), Thrall (39), DarkWarrior (36), SandArcher (35, body GEO — his second skinned GEO is the bow), HumanArcher (35), both Twins bodies (34 each), Enchantress (31) — joining SG, HG and the Soldier for an 11-enemy roster, selectable via T2T_ENEMIES (default: original trio). Not resolved: Mahasti (33 pairs but the gown slabs — own-clip route next), Chameleon/DarkReptus/Hunter (creature rigs, 22 pairs), Illusion (effect mesh, no clips), Rowan (rig not in bank), Pigeon (bird). Placement guard added: unplaceable enemies are dropped with a log line, never spawned at the origin.
+
+## Addendum 2026-10-23 (Mahasti resolved via her own clips)
+The "gown slab" was a red herring: Mahasti's name-map pairings were all anatomically correct — the pool's diving lunge swings her unanimated loincloth bones as a rigid panel. Her bank holds a dedicated 0x6603xxxx moveset (29 clips, 35 channels) that binds by IDENTITY on B_KA. Rostered with cycle a66a / spin-attack a66d / hit a649 / death a3f6 (forward collapse; no prone death in bank). Roster is now 12. Survey tool: src/bin/mahasti.rs; strips out/mahasti_*_identity.png.
+
+## Addendum 2026-10-23 (sand system + slow motion)
+Sand economy is in: SandTank in combat.rs (cap 6, +2 per kill credited once per death), R key spends 1 tank on 4 s of slow motion via per-actor dt scaling in animate_char (enemies 0.3x, Prince 0.9x, camera real-time). HUD shows the tank and a live slow-mo countdown; death resets the tank. Verified headless with staging envs T2T_SAND/T2T_SLOWMO_AT (log line + HUD countdown strip 4.0→0.2 s in out/evidence/prince_sand_slowmo_*). Suite 30 green.
+
+## Addendum 2026-10-23 (checkpoints + fall respawn)
+Respawn is now progress-based: a Checkpoint tracker (controller.rs) re-bases to any grounded spot 400+ units past the current one; deaths respawn there (yaw restored), and falling below the world (kill_z = AABB min - 400) is fatal through the same path. Verified live twice: checkpoint-seeded deaths x6 at the seeded dock spot; void-spawn fall recovered to the checkpoint and the fight proceeded. Suite 33 green. M6 is now feature-complete (traversal, pole, combat, 12-enemy roster, sand, checkpoints); remaining big rocks: GAM/action decode, clothed-body bind rig, M7 presentation.
+
+## Addendum 2026-10-23 (animation bank found; locomotion hunt II)
+The binding graph is solved to the bank level: AMIR record 0x2d000acc = the Prince's 183-slot animation bank (all descriptors, ordered); behaviors reference descriptors by key and pick bank indices from compiled bytecode (movement logic + debug strings in record 0xb40001a2). Exe/DLL raw-key tables: none. Stride census (new) over all 651 clips: no upright gait cycle for the Prince exists in the archive; lookalikes were Rowan/Hunter clips and traversal moves. Locomotion verdict stands, now six methods deep; the bank table itself (out/anim_bank.txt) is a permanent asset. Remaining cracks: behavior bytecode disassembly; Rowan's 0-bone skin GEO.
+
+## Addendum 2026-10-23 (clothed Prince: recovered statue, not playable)
+reconstruct_bind() (skin.rs + gao.rs mat_inv) recovers the clothed Prince's posed skeleton from its GEO bind matrices EXACTLY (RMS 0.0, 39/39). The loading mesh is a collapsed statue whose per-bone bind geometry matches the canonical rig under no rigid frame transform (searched translations/rotations/mirror; best mismatch 3.2), so canonical clips cannot play on it without per-bone axis correction — future research, documented in FORMATS.md. Game keeps the bare Prince body.
+
+## Addendum 2026-10-23 (GAM anatomy session)
+Bank record layout mapped (refs +0..+2360 of 5,364 B, grouped); descriptor anatomy extended (f32 at +34 = rate-class param, variable small-int tails from +52); behavior records are Jade VM bytecode with trailing string pools (movement = 4 functions in/near record 0xb40001a2; 0x21 opcode pattern). Locomotion remains bound inside the bytecode — a disassembler is the only route left and is a multi-session undertaking. Tools: bank_dump, bhv_dump.
+
+## Addendum 2026-10-23 (disassembler v1)
+Jade behavior records cracked at the structural level: header/pool/cell-stream split, (id,type) cell grammar with float-bit cells, function-id map (68 records; movement functions located: 0x5022 movement+coef record, 0x4eca TransitionToMovement, 0x504f TimeToTravel). jade_dis.rs prints annotated listings. Remaining: node grammar, the movement function's action values, and the action->animation mapping.

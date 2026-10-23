@@ -7,18 +7,27 @@ collected in one place. Each folder is a self-contained project.
 A clean-room 1:1 reimplementation of *Prince of Persia: The Two
 Thrones* in Rust + Bevy (`t2t-bevy/`), built purely from the game
 data files I own: a Jade BIG-archive reader, LZO decoder, skeletal
-animation playback, character controller with wall collision, and
-working traversal (ledge grab / hang / shimmy / climb, beam-walk
-mechanics) — verified by an automated test suite on the real game
-data. `NOTES.md` is the running research log; `t2t-bevy/docs/`
+animation playback, character controller with wall collision,
+working traversal (ledge grab / hang / shimmy / climb, beam and
+pole mechanics), a 12-enemy combat roster resolved from the game's
+own animation banks, the sand-tank slow-motion system, and
+checkpoints with void-fall recovery — all verified by an automated
+test suite (34 tests) on the real game data. The reverse
+engineering goes deep: the Prince's 183-entry animation bank (GAM)
+is fully mapped, the clothed loading-screen body was recovered
+exactly from its bind matrices, and a disassembler for the Jade VM
+behavior bytecode (`jade_dis`) has cracked the record grammar —
+locomotion in this engine is code-driven, which the data proves
+exhaustively. `NOTES.md` is the running research log; `t2t-bevy/docs/`
 holds the reverse-engineered format specs and roadmap.
 No game data is included in this repository.
 
 ## iw4l-battle-royale/
 A 100-player battle-royale mode for the IW4L (MW2) Rust/Bevy
 runtime: the 18→100 session-cap lift, entity re-basing, a BR
-gametype with a shrinking zone, plus the design plan, Windows
-guide, a GSC probe tool, and the three BR commits as a patch
+gametype with a shrinking zone, drop-in spawns with pistol start
+and scattered weapon loot (v2), plus the design plan, Windows
+guide, a GSC probe tool, and the four BR commits as a patch
 series (`br-commits.patch`, applies on upstream commit acc57a5).
 
 ## urban-reign-dlssnr/

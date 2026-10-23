@@ -66,7 +66,7 @@ fn quai_collision_and_spawn() {
     // Walk east for a second; she should move and stay grounded
     // (or fall cleanly if the dock ends — report, don't guess).
     let x0 = ctl.pos[0];
-    let input = t2t::controller::MoveInput { vel_xy: [150.0, 0.0], jump: false, drop: false };
+    let input = t2t::controller::MoveInput { vel_xy: [150.0, 0.0], jump: false, drop: false, pole_move: [0.0, 0.0] };
     for _ in 0..60 {
         ctl.step(&soup, &input, dt);
     }
@@ -101,7 +101,7 @@ fn wall_head_on_and_slide() {
     let mut ctl = Controller::new([-100.0, 0.0, 0.0]);
     ctl.grounded = true;
     for _ in 0..60 {
-        ctl.step(&soup, &MoveInput { vel_xy: [200.0, 0.0], jump: false, drop: false }, dt);
+        ctl.step(&soup, &MoveInput { vel_xy: [200.0, 0.0], jump: false, drop: false, pole_move: [0.0, 0.0] }, dt);
     }
     assert!((ctl.pos[0] + 25.0).abs() < 2.0, "head-on stop: {:?}", ctl.pos);
     assert!(ctl.grounded && ctl.pos[2].abs() < 0.01);
@@ -110,7 +110,7 @@ fn wall_head_on_and_slide() {
     let mut ctl = Controller::new([-100.0, 0.0, 0.0]);
     ctl.grounded = true;
     for _ in 0..60 {
-        ctl.step(&soup, &MoveInput { vel_xy: [200.0, 150.0], jump: false, drop: false }, dt);
+        ctl.step(&soup, &MoveInput { vel_xy: [200.0, 150.0], jump: false, drop: false, pole_move: [0.0, 0.0] }, dt);
     }
     assert!((ctl.pos[0] + 25.0).abs() < 2.0, "slide stop: {:?}", ctl.pos);
     assert!((ctl.pos[1] - 150.0).abs() < 5.0, "slide advance: {:?}", ctl.pos);

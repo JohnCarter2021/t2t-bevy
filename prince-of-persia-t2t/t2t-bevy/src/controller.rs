@@ -25,6 +25,13 @@ pub const HAND_HEIGHT: f32 = 170.0;
 /// Seconds a climb-up transition takes.
 pub const CLIMB_TIME: f32 = 0.45;
 
+/// Body offset from a pole's center while gripping it.
+pub const POLE_OFF: f32 = 38.0;
+/// Pole climb speed (Jade units/s).
+pub const POLE_CLIMB: f32 = 95.0;
+/// Pole orbit speed (rad/s).
+pub const POLE_ORBIT: f32 = 1.9;
+
 #[derive(Debug, Clone, Copy, Default)]
 pub struct MoveInput {
     /// Desired horizontal velocity (Jade units/s), XY plane.
@@ -32,6 +39,20 @@ pub struct MoveInput {
     pub jump: bool,
     /// Let go of a ledge (hang state only).
     pub drop: bool,
+    /// Pole controls: [climb (-1..1), orbit (-1..1)] —
+    /// read only while gripping a pole.
+    pub pole_move: [f32; 2],
+}
+
+/// Pole-grip state: the character clings to the column at
+/// `center`, positioned at `angle` around it.
+#[derive(Debug, Clone, Copy)]
+pub struct PoleState {
+    pub center: [f32; 2],
+    pub top: f32,
+    pub bottom: f32,
+    /// Angle around the column (radians, Jade XY plane).
+    pub angle: f32,
 }
 
 /// Ledge-hang state: the character grips `top`'s edge,
@@ -63,6 +84,11 @@ pub struct Controller {
     pub grounded: bool,
     pub hanging: Option<HangState>,
     pub beam: Option<BeamState>,
+    pub pole: Option<PoleState>,
+    /// Seconds before a pole can be re-grabbed after exit.
+    pub pole_cooldown: f32,
+    /// Throttle for the (expensive) pole search.
+    pub pole_scan: f32,
 }
 
 impl Controller {
@@ -74,6 +100,9 @@ impl Controller {
             grounded: false,
             hanging: None,
             beam: None,
+            pole: None,
+            pole_cooldown: 0.0,
+            pole_scan: 0.0,
         }
     }
 
@@ -95,6 +124,54 @@ impl Controller {
     }
 
     pub fn step(&mut self, soup: &TriangleSoup, input: &MoveInput, dt: f32) {
+        self.pole_cooldown = (self.pole_cooldown - dt).max(0.0);
+        self.pole_scan = (self.pole_scan - dt).max(0.0);
+        // ---- Pole state ----
+        if let Some(mut pole) = self.pole {
+            if input.drop {
+                self.pole = None;
+                self.pole_cooldown = 0.35;
+                self.grounded = false;
+                self.vel_z = 0.0;
+                // fall through to airborne physics below
+            } else if input.jump {
+                // Leap off, away from the column.
+                let radial = [pole.angle.cos(), pole.angle.sin()];
+                self.pos[0] += radial[0] * 30.0;
+                self.pos[1] += radial[1] * 30.0;
+                self.pole = None;
+                self.pole_cooldown = 0.35;
+                self.grounded = false;
+                self.vel_z = 420.0;
+                // fall through to airborne physics below
+            } else {
+                pole.angle += input.pole_move[1] * POLE_ORBIT * dt;
+                let mut z = self.pos[2] + input.pole_move[0] * POLE_CLIMB * dt;
+                z = z.clamp(pole.bottom + 2.0, (pole.top - 165.0).max(pole.bottom + 2.0));
+                let radial = [pole.angle.cos(), pole.angle.sin()];
+                self.pos = [
+                    pole.center[0] + radial[0] * POLE_OFF,
+                    pole.center[1] + radial[1] * POLE_OFF,
+                    z,
+                ];
+                self.yaw = (pole.angle + std::f32::consts::PI).rem_euclid(std::f32::consts::TAU);
+                self.vel_z = 0.0;
+                // Stepping off at the base: the floor is
+                // right under the feet.
+                if input.pole_move[0] < -0.01 {
+                    if let Some(g) = soup.ground_height(self.pos[0], self.pos[1], self.pos[2], STEP_UP) {
+                        if self.pos[2] <= g + 8.0 {
+                            self.pos[2] = g;
+                            self.pole = None;
+                            self.grounded = true;
+                            return;
+                        }
+                    }
+                }
+                self.pole = Some(pole);
+                return;
+            }
+        }
         // ---- Hang state ----
         if let Some(mut hang) = self.hanging {
             if hang.climbing > 0.0 {
@@ -162,6 +239,43 @@ impl Controller {
         self.pos[1] = resolved[1];
         if input.vel_xy[0].abs() > 0.01 || input.vel_xy[1].abs() > 0.01 {
             self.yaw = input.vel_xy[1].atan2(input.vel_xy[0]);
+        }
+
+        // Pole grab: airborne, near a column. The search
+        // radius is wider than the grab distance so the
+        // whole column is in range — a partial view biases
+        // the axis estimate. The search is throttled to
+        // ~7 Hz: it ray-probes the local geometry.
+        if !self.grounded
+            && self.hanging.is_none()
+            && self.pole.is_none()
+            && self.pole_cooldown <= 0.0
+            && self.pole_scan <= 0.0
+        {
+            self.pole_scan = 0.15;
+            if let Some(p) = soup.find_pole(self.pos, 175.0) {
+                let dx = self.pos[0] - p.center[0];
+                let dy = self.pos[1] - p.center[1];
+                let d = (dx * dx + dy * dy).sqrt();
+                if d <= 85.0 && self.pos[2] < p.top - 120.0 && self.pos[2] > p.bottom - 40.0 {
+                    let angle = dy.atan2(dx);
+                    let radial = [angle.cos(), angle.sin()];
+                    self.pos = [
+                        p.center[0] + radial[0] * POLE_OFF,
+                        p.center[1] + radial[1] * POLE_OFF,
+                        self.pos[2].clamp(p.bottom + 5.0, (p.top - 165.0).max(p.bottom + 5.0)),
+                    ];
+                    self.yaw = (angle + std::f32::consts::PI).rem_euclid(std::f32::consts::TAU);
+                    self.vel_z = 0.0;
+                    self.pole = Some(PoleState {
+                        center: p.center,
+                        top: p.top,
+                        bottom: p.bottom,
+                        angle,
+                    });
+                    return;
+                }
+            }
         }
 
         // Ledge grab: airborne, not rocketing upward, with a
@@ -233,5 +347,97 @@ impl Controller {
                 }
             }
         }
+    }
+}
+
+/// Checkpoint tracking: the last safe grounded spot the
+/// player reached, used as the respawn point. A new
+/// checkpoint is recorded when the player is grounded
+/// at least REBASE_DIST (XY) from the current one — so
+/// progress through a level keeps pulling the respawn
+/// point forward, while small movements (and anything
+/// airborne) never touch it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Checkpoint {
+    pub point: Option<[f32; 3]>,
+    pub yaw: f32,
+}
+
+impl Checkpoint {
+    /// Distance (XY, Jade units) that re-bases the
+    /// checkpoint.
+    pub const REBASE_DIST: f32 = 400.0;
+
+    pub fn new() -> Checkpoint {
+        Checkpoint { point: None, yaw: 0.0 }
+    }
+
+    /// Seed a checkpoint directly (level-placed points,
+    /// staging).
+    pub fn seed(&mut self, pos: [f32; 3], yaw: f32) {
+        self.point = Some(pos);
+        self.yaw = yaw;
+    }
+
+    /// Observe the player for this frame; returns true
+    /// when a NEW checkpoint was recorded.
+    pub fn observe(&mut self, pos: [f32; 3], yaw: f32, grounded: bool) -> bool {
+        if !grounded {
+            return false;
+        }
+        let far = match self.point {
+            None => true,
+            Some(p) => {
+                let dx = pos[0] - p[0];
+                let dy = pos[1] - p[1];
+                dx * dx + dy * dy >= Self::REBASE_DIST * Self::REBASE_DIST
+            }
+        };
+        if far {
+            self.point = Some(pos);
+            self.yaw = yaw;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Where a respawn goes: the checkpoint if one is
+    /// recorded, else the level spawn.
+    pub fn respawn_point(&self, fallback_spawn: [f32; 3]) -> [f32; 3] {
+        self.point.unwrap_or(fallback_spawn)
+    }
+}
+
+#[cfg(test)]
+mod checkpoint_tests {
+    use super::*;
+
+    #[test]
+    fn first_grounded_spot_becomes_the_checkpoint() {
+        let mut c = Checkpoint::new();
+        assert!(c.observe([10.0, 20.0, 60.0], 1.0, true));
+        assert_eq!(c.respawn_point([0.0; 3]), [10.0, 20.0, 60.0]);
+        assert_eq!(c.yaw, 1.0);
+    }
+
+    #[test]
+    fn airborne_and_small_moves_never_rebase() {
+        let mut c = Checkpoint::new();
+        assert!(c.observe([0.0, 0.0, 60.0], 0.0, true));
+        // Airborne far away: ignored.
+        assert!(!c.observe([900.0, 0.0, 300.0], 0.0, false));
+        // Grounded but only 399 away: ignored.
+        assert!(!c.observe([399.0, 0.0, 60.0], 0.0, true));
+        assert_eq!(c.respawn_point([9.0; 3]), [0.0, 0.0, 60.0]);
+        // Grounded 400+ away: re-based.
+        assert!(c.observe([400.0, 0.0, 60.0], 2.0, true));
+        assert_eq!(c.respawn_point([9.0; 3]), [400.0, 0.0, 60.0]);
+    }
+
+    #[test]
+    fn no_checkpoint_falls_back_to_spawn() {
+        let c = Checkpoint::new();
+        assert_eq!(c.respawn_point([1.0, 2.0, 3.0]), [1.0, 2.0, 3.0]);
     }
 }

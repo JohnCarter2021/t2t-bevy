@@ -105,3 +105,27 @@ budget is `inputs + transient ×2 + output ×2`, over presented unique
 shapes only. v1.2 prices the pre-flight envelope with those coefficients
 over the full distinct catalog: 754,397,568 B < 1 GiB. Extract over
 `C:\iw4l-br-v1` the same way; no environment variables needed.
+
+## v2 (2026-10-23) — drop-in spawns + loot
+
+All in the `iw4l_br/zone` GSC module (zone logic byte-identical):
+
+- **Drop-in spawns:** every player (you and bots) spawns with the DM class
+  loadout stripped, a Beretta pistol only, and is dropped from 1,400 units
+  above their spawn point. The descent is controlled (~4 seconds, velocity
+  zeroed every tick) so there is no fall damage; you can steer sideways
+  while falling. Note: dropping through a roof can happen on the rare
+  indoor spawn — cosmetic, you land at the right height inside.
+- **Loot:** after prematch, 1–2 weapons per DM spawn point are scattered
+  on the ground (real weapon world models, ground-snapped): ~55% SMGs and
+  shotguns, ~33% assault rifles and LMGs, ~12% snipers and launchers.
+  Walk over one to pick it up with full ammo — if you're still holding
+  the starter pistol it auto-switches. If you already carry that weapon,
+  the item stays for someone else. Bots pick loot up the same way.
+
+Test: same BR launch block (`$env:IW4L_GAMETYPE = "br"` in the launch
+window). Confirm: (1) you drop from the sky at match start with only a
+pistol; (2) a "loot has been scattered" message after prematch; (3) gun
+models on the ground near spawn areas; (4) walking over one gives it to
+you with a "Picked up" note; (5) bots occasionally show up carrying
+something better than a pistol.

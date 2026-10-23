@@ -19,7 +19,8 @@ use bevy::input::mouse::MouseMotion;
 use t2t::assemble::assemble;
 use t2t::bigfile::BigFile;
 use t2t::collision::TriangleSoup;
-use t2t::controller::{Controller, MoveInput, CLIMB_TIME};
+use t2t::combat::{Fighter, FighterState, SandTank, StrikeProfile};
+use t2t::controller::{Checkpoint, Controller, MoveInput, CLIMB_TIME};
 use t2t::jade_stream::decompress_entry;
 use t2t::skin::{posed_verts, ChannelMap, Character, Clip};
 use t2t::texture::decode_texture;
@@ -52,6 +53,30 @@ struct WorldMesh {
 /// An animated character: skinned mesh driven by a clip.
 /// Corner template: (vertex index, uv) per face corner; positions
 /// and flat normals are recomputed every frame.
+/// Pole clip set for the column-grip state.
+struct PoleClips {
+    grip: Clip,
+    climb: Clip,
+    spin: Clip,
+}
+
+/// A combat opponent: rig, clips, and spawn, loaded
+/// cross-sector like everything else.
+struct EnemySpec {
+    ch: Character,
+    /// Channel map for this enemy's clips (identity, or
+    /// name-based for cross-rig pool clips).
+    map: ChannelMap,
+    corners: Vec<(u16, [f32; 2])>,
+    move_cycle: Clip,
+    pounce: Clip,
+    hit: Clip,
+    death: Clip,
+    spawn: [f32; 3],
+    name: &'static str,
+    height: f32,
+}
+
 /// Traversal clip set for the hang state machine.
 struct Traversal {
     hang: Clip,
@@ -67,6 +92,10 @@ struct CharSpec {
     clip_air: Option<Clip>,
     clip_air_key: u32,
     traversal: Option<Traversal>,
+    pole_clips: Option<PoleClips>,
+    clip_attack: Option<Clip>,
+    clip_hit: Option<Clip>,
+    enemies: Vec<EnemySpec>,
     map: ChannelMap,
     corners: Vec<(u16, [f32; 2])>,
     /// Jade-space spawn (feet), her real level spot.
@@ -78,6 +107,8 @@ struct CharSpec {
     bevy_height: f32,
     name: &'static str,
     clip_key: u32,
+    /// Falling below this Jade z = out of the world.
+    kill_z: f32,
 }
 
 #[derive(Component)]
@@ -89,9 +120,103 @@ struct AnimatedChar {
     air_time: f32,
     /// Hang clock — runs while hanging (hang/shimmy clips).
     hang_time: f32,
+    /// Pole clock — runs while gripping a column.
+    pole_time: f32,
     ctl: Controller,
     orbit_yaw: f32,
     orbit_pitch: f32,
+    fighter: Fighter,
+    /// Sand resource: kills feed it, the R power spends it.
+    sand: SandTank,
+    /// Seconds of slow-motion remaining (0 = off).
+    slowmo_t: f32,
+    /// Real seconds since spawn (staging triggers).
+    elapsed: f32,
+    /// The T2T_SLOWMO_AT staging trigger fires once.
+    slowmo_staged: bool,
+    /// Last safe grounded spot — the respawn point.
+    checkpoint: Checkpoint,
+}
+
+/// The combat opponent, driven by a simple AI in the same
+/// system as the player (single-writer for both fighters).
+#[derive(Component)]
+struct EnemyChar {
+    /// Index into CharSpec.enemies.
+    idx: usize,
+    mesh: Handle<Mesh>,
+    ctl: Controller,
+    fighter: Fighter,
+    /// Free-running clock for looping clips.
+    time: f32,
+    /// Seconds since death (death clip progress).
+    dead_time: f32,
+    home: [f32; 3],
+    /// This death has already paid its sand to the Prince.
+    sand_paid: bool,
+}
+
+/// Marks the combat HUD text.
+#[derive(Component)]
+struct HudText;
+
+/// Sand economy: capacity, the kill bounty, and the
+/// slow-motion power (R key): cost, duration, and the
+/// per-actor time scales while it runs.
+const SAND_MAX: u32 = 6;
+const SAND_PER_KILL: u32 = 2;
+const SLOWMO_COST: u32 = 1;
+const SLOWMO_SECS: f32 = 4.0;
+const SLOWMO_ENEMY_SCALE: f32 = 0.3;
+const SLOWMO_PLAYER_SCALE: f32 = 0.9;
+
+/// A pre-activated checkpoint (staging: T2T_CHECKPOINT=
+/// x,y,z — stands in for a level-placed point the player
+/// already reached).
+fn seed_checkpoint() -> Checkpoint {
+    let mut c = Checkpoint::new();
+    if let Ok(v) = std::env::var("T2T_CHECKPOINT") {
+        let p: Vec<f32> = v.split(',').filter_map(|s| s.trim().parse().ok()).collect();
+        if p.len() == 3 {
+            c.seed([p[0], p[1], p[2]], 0.0);
+            println!("[t2t] checkpoint seeded at {:?}", c.point);
+        }
+    }
+    c
+}
+
+/// Starting sand (staging override: T2T_SAND=<n>).
+fn start_sand() -> u32 {
+    std::env::var("T2T_SAND")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0)
+}
+
+fn player_fighter() -> Fighter {
+    Fighter::new(
+        5,
+        StrikeProfile {
+            duration: 0.30,
+            active: (0.08, 0.22),
+            range: 250.0,
+            half_angle: 1.15,
+            damage: 1,
+        },
+    )
+}
+
+fn enemy_fighter() -> Fighter {
+    Fighter::new(
+        3,
+        StrikeProfile {
+            duration: 0.63,
+            active: (0.20, 0.45),
+            range: 265.0,
+            half_angle: 1.2,
+            damage: 1,
+        },
+    )
 }
 
 /// Marks the follow camera.
@@ -269,8 +394,248 @@ struct Preset {
     /// Sector holding the rig + body GEO ("" = the world
     /// sector itself).
     rig_sector: &'static str,
+    /// Combat setup: the player's attack/hit clips.
+    combat: Option<CombatSetup>,
+    /// Pole clips from Dynamic_Actions_Column:
+    /// (grip, climb, spin).
+    pole: Option<(u32, u32, u32)>,
     /// Traversal clips (hang, shimmy, climb) + their sector.
     traversal: Option<(&'static str, u32, u32, u32)>,
+}
+
+/// One combat opponent's definition: its own bank sector
+/// holds both the rig and the clips (all visually
+/// verified on that rig).
+#[derive(Clone, Copy)]
+struct EnemySetup {
+    /// Sector holding the CLIPS.
+    sector: &'static str,
+    /// Sector holding the RIG, when different from the
+    /// clip sector (the Babylonian Soldier's rig lives in
+    /// 100_Quai; his clips are the shared pool).
+    rig_sector: Option<&'static str>,
+    geo: u32,
+    prefix: &'static str,
+    /// Reference rig (sector, geo, prefix) whose bone
+    /// order indexes the clips, when the clips were not
+    /// authored on this rig: build a name-based channel
+    /// map from it. None = identity.
+    map_from: Option<(&'static str, u32, &'static str)>,
+    /// (move cycle, pounce, hit-react, death).
+    clips: (u32, u32, u32, u32),
+    name: &'static str,
+    height: f32,
+}
+
+/// Combat wiring for a preset: the player's strike clips
+/// and the enemy roster.
+#[derive(Clone, Copy)]
+struct CombatSetup {
+    /// (sector, key): the player's attack swing.
+    attack: (&'static str, u32),
+    /// (sector, key): the player's hit reaction.
+    hit: (&'static str, u32),
+    enemies: &'static [EnemySetup],
+}
+
+/// The Prince's roster. The Sand Garde fights from his
+/// own rig and bank (ACT_Enemy_SandGarde); the Human
+/// Guard from his (ACT_Enemy_HumanGarde, rig also in
+/// 100_Quai). Both play the shared enemy pool coherently
+/// on their own rigs — lunging cycle 6c0019e5, pounce
+/// 6c000506, knockdown-rise a20008ca, death a2000ac3 —
+/// verified pose-for-pose against the Sand Garde survey.
+/// Every other resolved enemy (the Babylonian Soldier
+/// first, then the full resolve_banks census) plays the
+/// pool through the NAME-BASED channel map from the Sand
+/// Garde's bone order: their rigs order the same Bip
+/// bones differently, and the map re-pairs channels by
+/// bone name. Pair counts (of SG's 46 channels) and the
+/// visual verdicts live in docs/FORMATS.md. NOT
+/// rostered: Chameleon, DarkReptus, Hunter (creature
+/// rigs), plus Illusion / Rowan / Pigeon (no fighter
+/// rig in bank).
+/// Mahasti is the exception that proves the rule: the
+/// pool slabs her loincloth, but her OWN bank carries a
+/// dedicated 0x6603xxxx moveset that plays on her rig by
+/// IDENTITY (cycle a66a stepping turn, pounce a66d spin
+/// flourish, hit a649 coil recoil, death a3f6 forward
+/// collapse — strips in out/mahasti_*_identity.png).
+/// T2T_ENEMIES selects who spawns: comma-separated name
+/// fragments, or "all"; unset = the original trio. The
+/// Prince strikes with the SpeedKill spin slash
+/// 4e001719 and reels with the AMIR knockback 970005d0.
+const PRINCE_COMBAT: CombatSetup = CombatSetup {
+    attack: ("Dynamic_Actions_SpeedKill_prince", 0x4e001719),
+    hit: ("AMIR_wow", 0x970005d0),
+    enemies: &[
+        EnemySetup {
+            sector: "ACT_Enemy_SandGarde",
+            rig_sector: None,
+            map_from: None,
+            geo: 0x51001f50,
+            prefix: "B_SG",
+            clips: (0x6c0019e5, 0x6c000506, 0xa20008ca, 0xa2000ac3),
+            name: "Sand Garde",
+            height: 175.0,
+        },
+        EnemySetup {
+            sector: "ACT_Enemy_HumanGarde",
+            rig_sector: None,
+            map_from: None,
+            geo: 0x5100019f,
+            prefix: "B_HG",
+            clips: (0x6c0019e5, 0x6c000506, 0xa20008ca, 0xa2000ac3),
+            name: "Human Guard",
+            height: 180.0,
+        },
+        // The Babylonian Soldier: his rig (in 100_Quai)
+        // orders the same Bip bones differently (arms
+        // before legs, no skirt bones), so the shared
+        // pool needs the name-based channel map from the
+        // Sand Garde's bone order — with it, the pool
+        // plays on him pose-for-pose (soldier_map survey).
+        EnemySetup {
+            sector: "ACT_Enemy_SandGarde",
+            rig_sector: Some("100_Quai"),
+            map_from: Some(("ACT_Enemy_SandGarde", 0x51001f50, "B_SG")),
+            geo: 0x42003196,
+            prefix: "B_BabylonSoldier",
+            clips: (0x6c0019e5, 0x6c000506, 0xa20008ca, 0xa2000ac3),
+            name: "Babylonian Soldier",
+            height: 192.0,
+        },
+        // Resolved by the resolve_banks census (name map
+        // from the Sand Garde, pool clips, strips verified
+        // pose-for-pose): SandGateGarde 42/46 pairs, Thrall
+        // 39/46, DarkWarrior 36/46, both archers 35/46,
+        // both Twins 34/46, Enchantress 31/46.
+        EnemySetup {
+            sector: "ACT_Enemy_SandGarde",
+            rig_sector: Some("ACT_Enemy_SandGateGarde"),
+            map_from: Some(("ACT_Enemy_SandGarde", 0x51001f50, "B_SG")),
+            geo: 0x51001f9d,
+            prefix: "B_SGG",
+            clips: (0x6c0019e5, 0x6c000506, 0xa20008ca, 0xa2000ac3),
+            name: "Sand Gate Garde",
+            height: 190.0,
+        },
+        EnemySetup {
+            sector: "ACT_Enemy_SandGarde",
+            rig_sector: Some("ACT_Enemy_Thrall"),
+            map_from: Some(("ACT_Enemy_SandGarde", 0x51001f50, "B_SG")),
+            geo: 0x51003f51,
+            prefix: "B_Thrall",
+            clips: (0x6c0019e5, 0x6c000506, 0xa20008ca, 0xa2000ac3),
+            name: "Thrall",
+            height: 200.0,
+        },
+        EnemySetup {
+            sector: "ACT_Enemy_SandGarde",
+            rig_sector: Some("ACT_Enemy_DarkWarrior"),
+            map_from: Some(("ACT_Enemy_SandGarde", 0x51001f50, "B_SG")),
+            geo: 0x5100417f,
+            prefix: "B_DW",
+            clips: (0x6c0019e5, 0x6c000506, 0xa20008ca, 0xa2000ac3),
+            name: "Dark Warrior",
+            height: 190.0,
+        },
+        EnemySetup {
+            sector: "ACT_Enemy_SandGarde",
+            rig_sector: Some("ACT_Enemy_SandArcher"),
+            map_from: Some(("ACT_Enemy_SandGarde", 0x51001f50, "B_SG")),
+            geo: 0x51002023,
+            prefix: "B_SA",
+            clips: (0x6c0019e5, 0x6c000506, 0xa20008ca, 0xa2000ac3),
+            name: "Sand Archer",
+            height: 180.0,
+        },
+        EnemySetup {
+            sector: "ACT_Enemy_SandGarde",
+            rig_sector: Some("ACT_Enemy_HumanArcher"),
+            map_from: Some(("ACT_Enemy_SandGarde", 0x51001f50, "B_SG")),
+            geo: 0x51001bdc,
+            prefix: "B_HA",
+            clips: (0x6c0019e5, 0x6c000506, 0xa20008ca, 0xa2000ac3),
+            name: "Human Archer",
+            height: 180.0,
+        },
+        EnemySetup {
+            sector: "ACT_Enemy_SandGarde",
+            rig_sector: Some("ACT_Enemy_Twins"),
+            map_from: Some(("ACT_Enemy_SandGarde", 0x51001f50, "B_SG")),
+            geo: 0x42002e1c,
+            prefix: "B_Twins",
+            clips: (0x6c0019e5, 0x6c000506, 0xa20008ca, 0xa2000ac3),
+            name: "Twin Warrior I",
+            height: 185.0,
+        },
+        EnemySetup {
+            sector: "ACT_Enemy_SandGarde",
+            rig_sector: Some("ACT_Enemy_Twins"),
+            map_from: Some(("ACT_Enemy_SandGarde", 0x51001f50, "B_SG")),
+            geo: 0x42002e93,
+            prefix: "B_Twins",
+            clips: (0x6c0019e5, 0x6c000506, 0xa20008ca, 0xa2000ac3),
+            name: "Twin Warrior II",
+            height: 185.0,
+        },
+        EnemySetup {
+            sector: "ACT_Enemy_SandGarde",
+            rig_sector: Some("ACT_Enemy_Enchantress"),
+            map_from: Some(("ACT_Enemy_SandGarde", 0x51001f50, "B_SG")),
+            geo: 0x42002ac9,
+            prefix: "B_Enchantress",
+            clips: (0x6c0019e5, 0x6c000506, 0xa20008ca, 0xa2000ac3),
+            name: "Enchantress",
+            height: 170.0,
+        },
+        // Mahasti: her own bank, her own moveset, identity
+        // binding (see the note above PRINCE_COMBAT).
+        EnemySetup {
+            sector: "ACT_Enemy_Mahasti",
+            rig_sector: None,
+            map_from: None,
+            geo: 0x42002c7d,
+            prefix: "B_KA",
+            clips: (0x6603a66a, 0x6603a66d, 0x6603a649, 0x6603a3f6),
+            name: "Mahasti",
+            height: 185.0,
+        },
+    ],
+};
+
+/// T2T_ENEMIES roster selection: unset = the original
+/// trio (the roster's first three); "all" = everyone;
+/// otherwise comma-separated name fragments, matched
+/// case-insensitively (an empty match falls back to all
+/// with a warning rather than an empty fight).
+fn select_enemies(roster: &'static [EnemySetup]) -> Vec<EnemySetup> {
+    match std::env::var("T2T_ENEMIES") {
+        Err(_) => roster.iter().take(3).copied().collect(),
+        Ok(v) if v.trim().eq_ignore_ascii_case("all") => roster.to_vec(),
+        Ok(v) => {
+            // Match ignoring case AND spaces, so "sandgate"
+            // finds "Sand Gate Garde".
+            let squash = |s: &str| s.to_lowercase().replace(' ', "");
+            let toks: Vec<String> = v
+                .split(',')
+                .map(|t| squash(t.trim()))
+                .filter(|t| !t.is_empty())
+                .collect();
+            let picked: Vec<EnemySetup> = roster
+                .iter()
+                .filter(|e| toks.iter().any(|t| squash(e.name).contains(t)))
+                .copied()
+                .collect();
+            if picked.is_empty() {
+                println!("[t2t] T2T_ENEMIES={v:?} matched nobody; using the full roster");
+                roster.to_vec()
+            } else {
+                picked
+            }
+        }
+    }
 }
 
 fn preset_for(wow_name: &str) -> Option<Preset> {
@@ -289,6 +654,8 @@ fn preset_for(wow_name: &str) -> Option<Preset> {
             air_clip: Some(("AMIR_wow", 0x33000ee7)),
             spawn_lift: 250.0,
             rig_sector: "PrinceFinal_Shape",
+            combat: Some(PRINCE_COMBAT),
+            pole: Some((0x4e00178a, 0x4e001784, 0x4e001796)),
             traversal: Some(("AMIR_wow", 0x33000811, 0x33000f52, 0x970000d3)),
         });
     }
@@ -305,6 +672,8 @@ fn preset_for(wow_name: &str) -> Option<Preset> {
             air_clip: None,
             spawn_lift: 2.0,
             rig_sector: "",
+            combat: None,
+            pole: None,
             traversal: None,
         })
     } else if wow_name.contains("PrinceFinal") {
@@ -321,6 +690,8 @@ fn preset_for(wow_name: &str) -> Option<Preset> {
             air_clip: Some(("AMIR_wow", 0x33000ee7)),
             spawn_lift: 250.0,
             rig_sector: "PrinceFinal_Shape",
+            combat: Some(PRINCE_COMBAT),
+            pole: Some((0x4e00178a, 0x4e001784, 0x4e001796)),
             // Verified traversal set from the AMIR bank:
             // hang idle, wall shimmy, ledge pull-up.
             traversal: Some(("AMIR_wow", 0x33000811, 0x33000f52, 0x970000d3)),
@@ -366,6 +737,71 @@ fn prepare_character(bf_path: &str, wow_name: &str, world: &WorldMesh) -> Option
     let (clip_air, clip_air_key) = match preset.air_clip {
         Some((sector, key)) => (Some(load_clip(sector, key)?), key),
         None => (None, 0),
+    };
+    // Combat: player strike clips + the enemy, loaded from
+    // their own sectors.
+    let (clip_attack, clip_hit, enemy_setups) = match preset.combat {
+        Some(c) => (
+            Some(load_clip(c.attack.0, c.attack.1)?),
+            Some(load_clip(c.hit.0, c.hit.1)?),
+            select_enemies(c.enemies),
+        ),
+        None => (None, None, Vec::new()),
+    };
+    let mut enemies: Vec<EnemySpec> = Vec::new();
+    for e in &enemy_setups {
+        let edata = load(e.sector)?;
+        let rig_data = match e.rig_sector {
+            Some(rs) => load(rs)?,
+            None => edata.clone(),
+        };
+        let ech = Character::load(&rig_data, e.geo, e.prefix)?;
+        let emap = match e.map_from {
+            Some((msec, mgeo, mpre)) => {
+                let mdata = load(msec)?;
+                let mch = Character::load(&mdata, mgeo, mpre)?;
+                ChannelMap::from_bone_names(&mch, mpre, &ech, e.prefix)
+            }
+            None => ChannelMap::Identity,
+        };
+        let erecs = walk_wow(&edata);
+        let eget = |key: u32| -> Option<Clip> {
+            let r = erecs.iter().find(|r| r.key == key)?;
+            Some(Clip::load(&edata[r.data_range()]))
+        };
+        let mut ecorners = Vec::with_capacity(ech.faces.len() * 3);
+        for f in &ech.faces {
+            for k in 0..3 {
+                let uvi = f[3 + k] as usize * 2;
+                let uv = if uvi + 1 < ech.uvs.len() {
+                    [ech.uvs[uvi], ech.uvs[uvi + 1]]
+                } else {
+                    [0.0, 0.0]
+                };
+                ecorners.push((f[k], uv));
+            }
+        }
+        enemies.push(EnemySpec {
+            ch: ech,
+            map: emap,
+            corners: ecorners,
+            move_cycle: eget(e.clips.0)?,
+            pounce: eget(e.clips.1)?,
+            hit: eget(e.clips.2)?,
+            death: eget(e.clips.3)?,
+            spawn: [0.0, 0.0, 0.0], // placed below, near the player
+            name: e.name,
+            height: e.height,
+        });
+    }
+    // Pole clip set (grip / climb / spin).
+    let pole_clips = match preset.pole {
+        Some((grip, climb, spin)) => Some(PoleClips {
+            grip: load_clip("Dynamic_Actions_Column", grip)?,
+            climb: load_clip("Dynamic_Actions_Column", climb)?,
+            spin: load_clip("Dynamic_Actions_Column", spin)?,
+        }),
+        None => None,
     };
     // Traversal clip set (hang / shimmy / climb).
     let traversal = match preset.traversal {
@@ -429,12 +865,71 @@ fn prepare_character(bf_path: &str, wow_name: &str, world: &WorldMesh) -> Option
     };
     let spawn = [sx + ox, sy + oy, gz + preset.spawn_lift + oz];
     println!("[t2t] character spawn (Jade): {spawn:?}");
+    // Enemy placement: grid-search around the player's
+    // anchor for ground on (nearly) the same floor — the
+    // dock is too narrow for fixed offsets. Each enemy
+    // must land at least 180 units from the ones already
+    // placed.
+    {
+        // The floor the player will actually stand on: in
+        // the anchor fallback, gz is the level's TOP, not a
+        // floor — search down the spawn column instead.
+        let floor_z = soup.ground_height(sx, sy, gz + 400.0, 30.0).unwrap_or(gz);
+        let mut placed: Vec<[f32; 3]> = Vec::new();
+        for e in enemies.iter_mut() {
+            let mut best: Option<(f32, [f32; 3])> = None;
+            for gx in -20..=20 {
+                for gy in -20..=20 {
+                    let (ex, ey) = (sx + gx as f32 * 30.0, sy + gy as f32 * 30.0);
+                    let dx = ex - sx;
+                    let dy = ey - sy;
+                    let d = (dx * dx + dy * dy).sqrt();
+                    if !(55.0..=560.0).contains(&d) {
+                        continue;
+                    }
+                    if placed.iter().any(|p| {
+                        let pdx = p[0] - ex;
+                        let pdy = p[1] - ey;
+                        pdx * pdx + pdy * pdy < 180.0 * 180.0
+                    }) {
+                        continue;
+                    }
+                    if let Some(eg) = soup.ground_height(ex, ey, floor_z + 60.0, 30.0) {
+                        if (eg - floor_z).abs() < 40.0 {
+                            let score = (d - 380.0).abs();
+                            if best.map_or(true, |(s, _)| score < s) {
+                                best = Some((score, [ex, ey, eg + 2.0]));
+                            }
+                        }
+                    }
+                }
+            }
+            if let Some((_, sp)) = best {
+                e.spawn = sp;
+                placed.push(sp);
+                println!("[t2t] enemy spawn (Jade): {} at {:?}", e.name, e.spawn);
+            }
+        }
+        // An enemy the grid could not place keeps the
+        // [0,0,0] sentinel spawn — never spawn it there.
+        enemies.retain(|e| {
+            let ok = e.spawn != [0.0, 0.0, 0.0];
+            if !ok {
+                println!("[t2t] enemy NOT placed (no floor found): {}", e.name);
+            }
+            ok
+        });
+    }
     Some(CharSpec {
         ch,
         clip,
         clip_air,
         clip_air_key,
         traversal,
+        pole_clips,
+        clip_attack,
+        clip_hit,
+        enemies,
         map,
         corners,
         spawn,
@@ -444,6 +939,7 @@ fn prepare_character(bf_path: &str, wow_name: &str, world: &WorldMesh) -> Option
         bevy_height: preset.height * world.scale,
         name: preset.name,
         clip_key: preset.clip,
+        kill_z: world2.aabb().0[2] - 400.0,
     })
 }
 
@@ -456,10 +952,58 @@ fn animate_char(
     spec: Res<CharSpec>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut q: Query<&mut AnimatedChar>,
+    mut q_enemy: Query<&mut EnemyChar>,
+    mut q_hud: Query<&mut Text, With<HudText>>,
     mut cam: Query<&mut Transform, With<FollowCam>>,
 ) {
     let dt = time.delta_secs().min(0.05);
     for mut ac in &mut q {
+        // Sand power: R spends a tank on slow motion
+        // (staging: T2T_SLOWMO_AT=<sec> fires it once).
+        // While it runs, the world crawls at 0.3x and the
+        // Prince moves at 0.9x — per-actor dt scaling.
+        ac.elapsed += dt;
+        ac.slowmo_t = (ac.slowmo_t - dt).max(0.0);
+        let staged = match std::env::var("T2T_SLOWMO_AT") {
+            Ok(v) => {
+                !ac.slowmo_staged
+                    && v.parse::<f32>().map_or(false, |at| ac.elapsed >= at)
+            }
+            Err(_) => false,
+        };
+        if (keys.just_pressed(KeyCode::KeyR) || staged) && ac.slowmo_t <= 0.0 {
+            if ac.sand.spend(SLOWMO_COST) {
+                ac.slowmo_t = SLOWMO_SECS;
+                println!(
+                    "[t2t] slow motion engaged (sand {} -> {})",
+                    ac.sand.sand + SLOWMO_COST,
+                    ac.sand.sand
+                );
+            } else if staged {
+                println!("[t2t] slow-mo staging fired but the tank is empty");
+            }
+            if staged {
+                ac.slowmo_staged = true;
+            }
+        }
+        let pdt = dt
+            * if ac.slowmo_t > 0.0 {
+                SLOWMO_PLAYER_SCALE
+            } else {
+                1.0
+            };
+        // Combat state: tick timers, trigger swings, and
+        // lock movement while attacking or reeling.
+        ac.fighter.update(pdt, 0.5);
+        if spec.clip_attack.is_some()
+            && (keys.just_pressed(KeyCode::KeyF) || mouse_buttons.just_pressed(MouseButton::Right))
+        {
+            ac.fighter.start_attack(0.55);
+        }
+        let busy = matches!(
+            ac.fighter.state,
+            FighterState::Attacking { .. } | FighterState::HitReact { .. }
+        );
         // Orbit: mouse drag (LMB held) or arrow keys.
         if mouse_buttons.pressed(MouseButton::Left) {
             for ev in mouse_motion.read() {
@@ -493,8 +1037,24 @@ fn animate_char(
         if keys.pressed(KeyCode::KeyA) {
             wish = [wish[0] - right[0], wish[1] - right[1]];
         }
+        // On a pole, WASD drives the grip instead of
+        // walking: W/S climb, A/D orbit; S no longer drops.
+        let on_pole = ac.ctl.pole.is_some();
+        if busy || on_pole {
+            wish = [0.0, 0.0];
+        }
         let wl = (wish[0] * wish[0] + wish[1] * wish[1]).sqrt();
         let speed = if keys.pressed(KeyCode::ShiftLeft) { 340.0 } else { 170.0 };
+        let pole_move = if on_pole {
+            [
+                (if keys.pressed(KeyCode::KeyW) { 1.0 } else { 0.0 })
+                    + (if keys.pressed(KeyCode::KeyS) { -1.0 } else { 0.0 }),
+                (if keys.pressed(KeyCode::KeyA) { 1.0 } else { 0.0 })
+                    + (if keys.pressed(KeyCode::KeyD) { -1.0 } else { 0.0 }),
+            ]
+        } else {
+            [0.0, 0.0]
+        };
         let input = MoveInput {
             vel_xy: if wl > 0.01 {
                 [wish[0] / wl * speed, wish[1] / wl * speed]
@@ -502,22 +1062,69 @@ fn animate_char(
                 [0.0, 0.0]
             },
             jump: keys.just_pressed(KeyCode::Space),
-            drop: keys.just_pressed(KeyCode::KeyS),
+            drop: keys.just_pressed(KeyCode::KeyS) && !on_pole,
+            pole_move,
         };
         // Fixed-substep physics for stability.
         let steps = 2;
         for _ in 0..steps {
-            ac.ctl.step(&spec.soup, &input, dt / steps as f32);
+            ac.ctl.step(&spec.soup, &input, pdt / steps as f32);
+        }
+        // Checkpoints: a grounded spot 400+ units past
+        // the current one becomes the respawn point.
+        let (cpos, cyaw, cgrounded) = (ac.ctl.pos, ac.ctl.yaw, ac.ctl.grounded);
+        if ac.fighter.alive() && ac.checkpoint.observe(cpos, cyaw, cgrounded) {
+            println!("[t2t] checkpoint set at {cpos:?}");
+        }
+        // Falling out of the world is fatal; in a combat
+        // sector the reset below handles the respawn, in
+        // a quiet sector it happens right here.
+        if ac.ctl.pos[2] < spec.kill_z && ac.fighter.alive() {
+            println!("[t2t] the Prince fell out of the world (z {:.0})", ac.ctl.pos[2]);
+            ac.fighter.take_hit(999);
+        }
+        if spec.enemies.is_empty() && ac.fighter.state == FighterState::Dead {
+            let rp = ac.checkpoint.respawn_point(spec.spawn);
+            println!("[t2t] respawning at {rp:?}");
+            ac.ctl = Controller::new(rp);
+            ac.ctl.yaw = ac.checkpoint.yaw;
+            ac.fighter = player_fighter();
+            ac.sand = SandTank::new(SAND_MAX, start_sand());
+            ac.slowmo_t = 0.0;
         }
 
         // Animation time + mesh rebuild. State-driven clip
         // choice: hanging -> traversal set, airborne -> the
         // air clip (own clock), grounded -> the main clip.
-        ac.time += dt;
+        ac.time += pdt;
         let mut fixed_frame: Option<u32> = None;
+        // Combat clips take priority over traversal/air.
+        let combat_pick: Option<(&Clip, u32)> = match (ac.fighter.state, &spec.clip_attack, &spec.clip_hit) {
+            (FighterState::Attacking { t, .. }, Some(atk), _) => {
+                let f = (t / ac.fighter.strike.duration * (atk.max_frame + 1) as f32) as u32;
+                Some((atk, f.min(atk.max_frame)))
+            }
+            (FighterState::HitReact { t }, _, Some(hit)) => {
+                let f = (t / 0.5 * (hit.max_frame + 1) as f32) as u32;
+                Some((hit, f.min(hit.max_frame)))
+            }
+            _ => None,
+        };
         let (active_clip, active_time) =
-            if let (Some(trav), Some(h)) = (&spec.traversal, ac.ctl.hanging) {
-                ac.hang_time += dt;
+            if let Some((c, f)) = combat_pick {
+                fixed_frame = Some(f);
+                (c, 0.0)
+            } else if let (Some(pc), Some(_)) = (&spec.pole_clips, ac.ctl.pole) {
+                ac.pole_time += pdt;
+                if pole_move[0].abs() > 0.01 {
+                    (&pc.climb, ac.pole_time)
+                } else if pole_move[1].abs() > 0.01 {
+                    (&pc.spin, ac.pole_time)
+                } else {
+                    (&pc.grip, ac.pole_time)
+                }
+            } else if let (Some(trav), Some(h)) = (&spec.traversal, ac.ctl.hanging) {
+                ac.hang_time += pdt;
                 if h.climbing > 0.0 {
                     let f = (h.climbing / CLIMB_TIME * trav.climb.max_frame as f32) as u32;
                     fixed_frame = Some(f.min(trav.climb.max_frame));
@@ -531,7 +1138,7 @@ fn animate_char(
                 ac.hang_time = 0.0;
                 match (&spec.clip_air, ac.ctl.grounded) {
                     (Some(air), false) => {
-                        ac.air_time += dt;
+                        ac.air_time += pdt;
                         (air, ac.air_time)
                     }
                     _ => {
@@ -572,6 +1179,139 @@ fn animate_char(
         for mut t in &mut cam {
             *t = Transform::from_translation(cam_pos)
                 .looking_at(Vec3::new(char_bevy[0], char_bevy[1] + h * 0.55, char_bevy[2]), Vec3::Y);
+        }
+    }
+
+    // ---- Combat: strikes, the enemy AI, respawn, HUD ----
+    if !spec.enemies.is_empty() {
+        let mut foes: Vec<Mut<EnemyChar>> = q_enemy.iter_mut().collect();
+        let mut hud = String::new();
+        // Enemies live on world time: slowed while the
+        // Prince's slow motion runs.
+        let edt = dt
+            * if q.single().map_or(false, |ac| ac.slowmo_t > 0.0) {
+                SLOWMO_ENEMY_SCALE
+            } else {
+                1.0
+            };
+        for ec in foes.iter_mut() {
+            let e_spec = &spec.enemies[ec.idx];
+            ec.fighter.update(edt, 0.9);
+            ec.time += edt;
+            let epos = ec.ctl.pos;
+            let (p_pos, _p_yaw) = q
+                .single()
+                .map(|ac| (ac.ctl.pos, ac.ctl.yaw))
+                .unwrap_or((spec.spawn, 0.0));
+            // The player's swing, resolved against this
+            // enemy (one connection per swing: hit_done is
+            // on the attacker).
+            if let Ok(mut ac) = q.single_mut() {
+                let (pp, py) = (ac.ctl.pos, ac.ctl.yaw);
+                ac.fighter.strike_connects(pp, py, epos, &mut ec.fighter);
+            }
+            let to_player = [p_pos[0] - epos[0], p_pos[1] - epos[1]];
+            let dist = (to_player[0] * to_player[0] + to_player[1] * to_player[1]).sqrt();
+            let (e_clip, e_frame): (&Clip, u32) = match ec.fighter.state {
+                FighterState::Dead => {
+                    // A kill feeds the Prince's sand, once.
+                    if !ec.sand_paid {
+                        ec.sand_paid = true;
+                        if let Ok(mut ac) = q.single_mut() {
+                            let got = ac.sand.gain(SAND_PER_KILL);
+                            println!(
+                                "[t2t] {} falls - the Prince absorbs {got} sand (tank {}/{})",
+                                e_spec.name, ac.sand.sand, ac.sand.max
+                            );
+                        }
+                    }
+                    ec.dead_time += edt;
+                    let f = ((ec.dead_time / 1.1).min(1.0) * e_spec.death.max_frame as f32) as u32;
+                    (&e_spec.death, f)
+                }
+                FighterState::HitReact { t } => {
+                    let f = (t / 0.9 * (e_spec.hit.max_frame + 1) as f32) as u32;
+                    (&e_spec.hit, f.min(e_spec.hit.max_frame))
+                }
+                FighterState::Attacking { t, .. } => {
+                    if let Ok(mut ac) = q.single_mut() {
+                        let (pp, ey) = (ac.ctl.pos, ec.ctl.yaw);
+                        ec.fighter.strike_connects(epos, ey, pp, &mut ac.fighter);
+                    }
+                    let f = (t / ec.fighter.strike.duration * (e_spec.pounce.max_frame + 1) as f32) as u32;
+                    (&e_spec.pounce, f.min(e_spec.pounce.max_frame))
+                }
+                FighterState::Ready => {
+                    if dist < 1100.0 && dist > 1e-6 {
+                        if dist > 215.0 {
+                            let v = [
+                                to_player[0] / dist * 165.0,
+                                to_player[1] / dist * 165.0,
+                            ];
+                            let inp = MoveInput { vel_xy: v, jump: false, drop: false, pole_move: [0.0, 0.0] };
+                            for _ in 0..2 {
+                                ec.ctl.step(&spec.soup, &inp, edt / 2.0);
+                            }
+                        } else {
+                            ec.ctl.yaw = to_player[1].atan2(to_player[0]);
+                            ec.fighter.start_attack(1.6);
+                        }
+                    }
+                    let f = ((ec.time * 30.0) as u32) % (e_spec.move_cycle.max_frame + 1);
+                    (&e_spec.move_cycle, f)
+                }
+            };
+            let (positions, normals) = char_corners(
+                &e_spec.ch,
+                e_clip,
+                &e_spec.map,
+                e_frame,
+                ec.ctl.pos,
+                ec.ctl.yaw,
+                spec.center,
+                spec.scale,
+            );
+            if let Some(mesh) = meshes.get_mut(&ec.mesh) {
+                mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, positions);
+                mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, normals);
+            }
+            hud.push_str(&format!(
+                "    {} HP {} / {}",
+                e_spec.name, ec.fighter.hp, ec.fighter.max_hp
+            ));
+        }
+        // Player death -> reset the whole fight.
+        if let Ok(mut ac) = q.single_mut() {
+            if ac.fighter.state == FighterState::Dead {
+                let rp = ac.checkpoint.respawn_point(spec.spawn);
+                if ac.checkpoint.point.is_some() {
+                    println!("[t2t] the Prince falls - respawning at checkpoint {rp:?}");
+                } else {
+                    println!("[t2t] the Prince falls - respawning all fighters");
+                }
+                ac.ctl = Controller::new(rp);
+                ac.ctl.yaw = ac.checkpoint.yaw;
+                ac.fighter = player_fighter();
+                ac.sand = SandTank::new(SAND_MAX, start_sand());
+                ac.slowmo_t = 0.0;
+                for ec in foes.iter_mut() {
+                    ec.ctl = Controller::new(ec.home);
+                    ec.fighter = enemy_fighter();
+                    ec.dead_time = 0.0;
+                    ec.sand_paid = false;
+                }
+            }
+            if let Ok(mut text) = q_hud.single_mut() {
+                let slow = if ac.slowmo_t > 0.0 {
+                    format!("    [SLOW-MO {:.1}s]", ac.slowmo_t)
+                } else {
+                    String::new()
+                };
+                **text = format!(
+                    "Prince HP {} / {}    Sand {} / {}{}{}",
+                    ac.fighter.hp, ac.fighter.max_hp, ac.sand.sand, ac.sand.max, hud, slow
+                );
+            }
         }
     }
 }
@@ -669,11 +1409,78 @@ fn setup(
                 time: 0.0,
                 air_time: 0.0,
                 hang_time: 0.0,
+                pole_time: 0.0,
                 ctl: ctl0,
                 orbit_yaw: 0.0,
                 orbit_pitch: 0.25,
+                fighter: player_fighter(),
+                sand: SandTank::new(SAND_MAX, start_sand()),
+                slowmo_t: 0.0,
+                elapsed: 0.0,
+                slowmo_staged: false,
+                checkpoint: seed_checkpoint(),
             },
         ));
+        // Combat opponents + HUD.
+        for (idx, e) in spec.enemies.iter().enumerate() {
+            let (ep, en) = char_corners(
+                &e.ch,
+                &e.move_cycle,
+                &e.map,
+                0,
+                e.spawn,
+                0.0,
+                spec.center,
+                spec.scale,
+            );
+            let en_n = ep.len();
+            let mut emesh = Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::default());
+            emesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, ep);
+            emesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, en);
+            emesh.insert_attribute(
+                Mesh::ATTRIBUTE_UV_0,
+                e.corners.iter().map(|c| c.1).collect::<Vec<_>>(),
+            );
+            emesh.insert_attribute(
+                Mesh::ATTRIBUTE_COLOR,
+                vec![[0.72f32, 0.62, 0.5, 1.0]; en_n],
+            );
+            emesh.insert_indices(Indices::U32((0..en_n as u32).collect()));
+            let ehandle = meshes.add(emesh);
+            println!("[t2t] enemy: {} ({} corners)", e.name, en_n);
+            commands.spawn((
+                Mesh3d(ehandle.clone()),
+                MeshMaterial3d(materials.add(StandardMaterial {
+                    base_color: Color::WHITE,
+                    ..default()
+                })),
+                Transform::default(),
+                EnemyChar {
+                    idx,
+                    mesh: ehandle,
+                    ctl: Controller::new(e.spawn),
+                    fighter: enemy_fighter(),
+                    time: 0.0,
+                    dead_time: 0.0,
+                    home: e.spawn,
+                    sand_paid: false,
+                },
+            ));
+        }
+        if !spec.enemies.is_empty() {
+            commands.spawn((
+                Text::new(""),
+                TextFont { font_size: 24.0, ..default() },
+                TextColor(Color::WHITE),
+                Node {
+                    position_type: PositionType::Absolute,
+                    top: Val::Px(14.0),
+                    left: Val::Px(14.0),
+                    ..default()
+                },
+                HudText,
+            ));
+        }
     }
     commands.spawn((
         Camera3d::default(),

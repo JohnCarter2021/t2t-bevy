@@ -112,6 +112,61 @@ pub fn parse_gao(d: &[u8]) -> Option<GaoInfo> {
 }
 
 /// Apply a column-major 4x4 to a point.
+/// General 4x4 inverse (Gauss-Jordan with pivoting).
+/// Matrices here are column-major ([f32;16], translation
+/// at [12..14]); the inversion treats them consistently,
+/// so the result composes correctly with mat_mul.
+pub fn mat_inv(m: &[f32; 16]) -> Option<[f32; 16]> {
+    // Jade matrices often carry ~0 in m[15] (only the
+    // 3x4 part is meaningful); complete the affine
+    // bottom row before inverting.
+    let mut m = *m;
+    if m[15].abs() < 0.5 && m[3].abs() < 1e-6 && m[7].abs() < 1e-6 && m[11].abs() < 1e-6 {
+        m[15] = 1.0;
+    }
+    let m = &m;
+    let mut a = [[0.0f32; 8]; 4];
+    for r in 0..4 {
+        for c in 0..4 {
+            a[r][c] = m[c * 4 + r];
+            a[r][c + 4] = if r == c { 1.0 } else { 0.0 };
+        }
+    }
+    for col in 0..4 {
+        let mut piv = col;
+        for r in col + 1..4 {
+            if a[r][col].abs() > a[piv][col].abs() {
+                piv = r;
+            }
+        }
+        if a[piv][col].abs() < 1e-9 {
+            return None;
+        }
+        a.swap(col, piv);
+        let d = a[col][col];
+        for c in 0..8 {
+            a[col][c] /= d;
+        }
+        for r in 0..4 {
+            if r != col {
+                let f = a[r][col];
+                if f != 0.0 {
+                    for c in 0..8 {
+                        a[r][c] -= f * a[col][c];
+                    }
+                }
+            }
+        }
+    }
+    let mut out = [0.0f32; 16];
+    for r in 0..4 {
+        for c in 0..4 {
+            out[c * 4 + r] = a[r][c + 4];
+        }
+    }
+    Some(out)
+}
+
 pub fn transform_point(m: &[f32; 16], p: [f32; 3]) -> [f32; 3] {
     [
         m[0] * p[0] + m[4] * p[1] + m[8] * p[2] + m[12],

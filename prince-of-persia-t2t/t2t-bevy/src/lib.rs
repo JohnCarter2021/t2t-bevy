@@ -2,6 +2,7 @@ pub mod anim;
 pub mod assemble;
 pub mod bigfile;
 pub mod collision;
+pub mod combat;
 pub mod controller;
 pub mod gao;
 pub mod geometry;

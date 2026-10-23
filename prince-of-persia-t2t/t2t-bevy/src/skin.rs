@@ -11,7 +11,7 @@
 use std::collections::HashMap;
 
 use crate::anim::{parse_clip, read_rot5_keys, read_rot_keys, read_trans13_keys, read_trans_keys, RotKey, SectionRole, TransKey};
-use crate::gao::{mat_mul, parse_gao, transform_point, IDENTITY};
+use crate::gao::{mat_inv, mat_mul, parse_gao, transform_point, IDENTITY};
 use crate::geometry::parse_geometry;
 use crate::wow::walk_wow;
 
@@ -104,6 +104,42 @@ impl Character {
 
     pub fn bind_locals(&self) -> Vec<M> {
         self.bones.iter().map(|b| b.3.unwrap_or(IDENTITY)).collect()
+    }
+
+    /// Reconstruct the bind pose from the GEO's own bind
+    /// matrices, for sectors that store their rig posed
+    /// (e.g. PrinceLoading_Shape's clothed Prince). At
+    /// bind, (root * G_b) * B_b = I for every skin bone;
+    /// taking the root as identity gives G_b = B_b^-1
+    /// directly. Locals are re-derived from those globals
+    /// via the father chain; non-skin bones keep their
+    /// composed globals (they do not deform this GEO).
+    /// The (root, globals) pair is only defined up to a
+    /// common left factor, so this is exact for any
+    /// character, not just posed ones.
+    pub fn reconstruct_bind(&mut self) {
+        let composed = self.compose_globals(&self.bind_locals());
+        let mut globals: Vec<M> = composed;
+        for (bidx, bind) in &self.skin {
+            if let Some(inv) = mat_inv(bind) {
+                globals[*bidx as usize] = inv;
+            }
+        }
+        let inv_globals: Vec<Option<M>> = globals.iter().map(|g| mat_inv(g)).collect();
+        for i in 0..self.bones.len() {
+            let father = self.bones[i].2;
+            let local = if let Some(&fi) = self.by_key.get(&father) {
+                match inv_globals[fi] {
+                    Some(inv) => mat_mul(&inv, &globals[i]),
+                    None => globals[i],
+                }
+            } else {
+                globals[i]
+            };
+            self.bones[i].3 = Some(local);
+            self.bones[i].4 = Some(globals[i]);
+        }
+        self.root_global = IDENTITY;
     }
 
     /// Compose skeleton globals from per-bone locals.
@@ -242,6 +278,50 @@ pub enum ChannelMap {
 }
 
 impl ChannelMap {
+    /// Build a channel map between two rigs whose bone
+    /// GAOs follow the 3ds-Max Bip naming convention
+    /// ("B_<rig>_Bip L ForeArm.gao" / "B_<rig> L
+    /// Forearm.gao"): clip channels are indexed by the
+    /// SOURCE rig's bone order; pair each with the target
+    /// bone of the same normalized name. This is what the
+    /// shared enemy pool needs on rigs whose bone ORDER
+    /// differs (the Babylonian Soldier keeps the bip
+    /// layout but orders arms before legs and has no
+    /// skirt/ribbon bones — identity mapping folds him
+    /// into a knot, name mapping plays the pool cleanly:
+    /// 34 of the Sand Garde's 46 channels match).
+    pub fn from_bone_names(
+        src: &Character,
+        src_prefix: &str,
+        dst: &Character,
+        dst_prefix: &str,
+    ) -> ChannelMap {
+        fn norm(name: &str, prefix: &str) -> String {
+            let s = name.strip_prefix(prefix).unwrap_or(name);
+            let s = s.trim_start_matches(['_', ' ']);
+            let s = s.strip_prefix("Bip").unwrap_or(s);
+            let s = s.trim_start_matches(['_', ' ']);
+            let s = s.strip_suffix(".gao").unwrap_or(s);
+            s.trim().to_lowercase()
+        }
+        let mut pairs = Vec::new();
+        for (ci, b) in src.bones.iter().enumerate() {
+            let suf = norm(&b.1, src_prefix);
+            if suf.is_empty() {
+                continue;
+            }
+            if let Some((bi, _)) = dst
+                .bones
+                .iter()
+                .enumerate()
+                .find(|(_, db)| norm(&db.1, dst_prefix) == suf)
+            {
+                pairs.push((ci, bi));
+            }
+        }
+        ChannelMap::Header(pairs)
+    }
+
     pub fn from_header(header_data: &[u8]) -> ChannelMap {
         let pairs = header_data
             .chunks_exact(3)

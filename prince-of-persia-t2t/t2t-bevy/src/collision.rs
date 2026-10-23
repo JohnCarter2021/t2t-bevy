@@ -15,6 +15,16 @@ pub struct BeamSpan {
     pub z: f32,
 }
 
+/// A climbable pole found by `TriangleSoup::find_pole`.
+#[derive(Debug, Clone, Copy)]
+pub struct Pole {
+    /// Column center in the XY plane.
+    pub center: [f32; 2],
+    /// Highest/lowest wall geometry of the column.
+    pub top: f32,
+    pub bottom: f32,
+}
+
 /// A ledge found by `TriangleSoup::find_ledge`.
 #[derive(Debug, Clone, Copy)]
 pub struct Ledge {
@@ -182,6 +192,121 @@ impl TriangleSoup {
         })
     }
 
+    /// A climbable pole near `pos`, found by ray probing:
+    /// a point is a pole axis when horizontal rays at
+    /// several heights hit walls in at least 5 of 8
+    /// directions within 75 units (a ring, >= 6 of 8 —
+    /// a point ON a face only reaches 5 via corner hits). Real level
+    /// meshes are too coarse for centroid clustering —
+    /// their wall triangles are huge — so the detector
+    /// probes geometry directly. Candidates are scanned
+    /// on a 20-unit grid nearest-first, then centered by
+    /// opposing-ray imbalance, the vertical span
+    /// is walked while the ring holds.
+    pub fn find_pole(&self, pos: [f32; 3], max_dist: f32) -> Option<Pole> {
+        // Local wall triangles only (centroid window).
+        let local: Vec<&[f32; 9]> = self
+            .tris
+            .iter()
+            .filter(|t| {
+                let cx = (t[0] + t[3] + t[6]) / 3.0 - pos[0];
+                let cy = (t[1] + t[4] + t[7]) / 3.0 - pos[1];
+                let cz = (t[2] + t[5] + t[8]) / 3.0;
+                cx * cx + cy * cy < 260.0 * 260.0
+                    && cz > pos[2] - 320.0
+                    && cz < pos[2] + 720.0
+                    && is_wall(t)
+            })
+            .collect();
+        if local.is_empty() {
+            return None;
+        }
+        // Candidate grid, nearest first.
+        let step = 20.0f32;
+        let n = (max_dist / step) as i32;
+        let mut cands: Vec<(f32, [f32; 2])> = Vec::new();
+        for i in -n..=n {
+            for j in -n..=n {
+                let c = [pos[0] + i as f32 * step, pos[1] + j as f32 * step];
+                let d = ((c[0] - pos[0]).powi(2) + (c[1] - pos[1]).powi(2)).sqrt();
+                if d <= max_dist {
+                    cands.push((d, c));
+                }
+            }
+        }
+        cands.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+        for (_, c0) in cands {
+            // Ring must hold at all 3 probe heights
+            // (mid-column; near the caps the grip clamp
+            // forbids holding anyway).
+            let mut ok = 0;
+            for dz in [-100.0, 0.0, 100.0] {
+                if ring_hits(&local, c0, pos[2] + dz).is_some() {
+                    ok += 1;
+                }
+            }
+            if ok < 3 {
+                continue;
+            }
+            // Center by opposing-ray imbalance.
+            let mut c = c0;
+            for _ in 0..3 {
+                match ring_hits(&local, c, pos[2]) {
+                    Some(hits) => {
+                        let mut shift = [0.0f32; 2];
+                        let mut pairs = 0;
+                        for k in 0..4 {
+                            let (t1, t2) = (hits[k], hits[k + 4]);
+                            if let (Some(a), Some(b)) = (t1, t2) {
+                                let d = dir8(k);
+                                let s = (a - b) / 2.0;
+                                shift[0] += d[0] * s;
+                                shift[1] += d[1] * s;
+                                pairs += 1;
+                            }
+                        }
+                        if pairs == 0 {
+                            break;
+                        }
+                        c[0] += shift[0] / pairs as f32;
+                        c[1] += shift[1] / pairs as f32;
+                    }
+                    None => break,
+                }
+            }
+            if ring_hits(&local, c, pos[2]).is_none() {
+                continue;
+            }
+            // Walk the span while the ring holds.
+            let mut top = pos[2];
+            let mut z = pos[2];
+            while z < pos[2] + 640.0 {
+                z += 40.0;
+                if ring_hits(&local, c, z).is_some() {
+                    top = z;
+                } else {
+                    break;
+                }
+            }
+            let mut bottom = pos[2];
+            let mut z = pos[2];
+            while z > pos[2] - 400.0 {
+                z -= 40.0;
+                if ring_hits(&local, c, z).is_some() {
+                    bottom = z;
+                } else {
+                    break;
+                }
+            }
+            let (top, bottom) = (top + 20.0, bottom - 20.0);
+            if top - bottom < 150.0 {
+                continue;
+            }
+            return Some(Pole { center: c, top, bottom });
+        }
+        None
+    }
+
     /// A grabbable ledge: the top edge of a raised floor.
     /// `top` is a point on the floor just inside the edge;
     /// `normal` is the horizontal direction from the wall
@@ -283,5 +408,89 @@ impl TriangleSoup {
             }
         }
         best
+    }
+}
+
+/// True when the triangle is (mostly) vertical.
+fn is_wall(t: &[f32; 9]) -> bool {
+    let (ux, uy, uz) = (t[3] - t[0], t[4] - t[1], t[5] - t[2]);
+    let (vx, vy, vz) = (t[6] - t[0], t[7] - t[1], t[8] - t[2]);
+    let nz = ux * vy - uy * vx;
+    let nl = ((uy * vz - uz * vy).powi(2) + (uz * vx - ux * vz).powi(2) + nz * nz).sqrt();
+    nl >= 1e-9 && (nz / nl).abs() < 0.5
+}
+
+/// The 8 compass directions (k and k+4 are opposites).
+fn dir8(k: usize) -> [f32; 2] {
+    const D: [[f32; 2]; 8] = [
+        [1.0, 0.0],
+        [0.7071, 0.7071],
+        [0.0, 1.0],
+        [-0.7071, 0.7071],
+        [-1.0, 0.0],
+        [-0.7071, -0.7071],
+        [0.0, -1.0],
+        [0.7071, -0.7071],
+    ];
+    D[k % 8]
+}
+
+/// Cast a horizontal ray at height `z` from `c` along
+/// `d`; nearest wall hit distance in (4, 75), if any.
+fn ray_wall(local: &[&[f32; 9]], c: [f32; 2], z: f32, d: [f32; 2]) -> Option<f32> {
+    let mut best: Option<f32> = None;
+    for t in local {
+        // The triangle must straddle the ray height.
+        let (z0, z1, z2) = (t[2], t[5], t[8]);
+        if z < z0.min(z1).min(z2) || z > z0.max(z1).max(z2) {
+            continue;
+        }
+        let e1 = [t[3] - t[0], t[4] - t[1], t[5] - t[2]];
+        let e2 = [t[6] - t[0], t[7] - t[1], t[8] - t[2]];
+        // p = dir x e2 (dir has z = 0)
+        let p = [d[1] * e2[2], -d[0] * e2[2], d[0] * e2[1] - d[1] * e2[0]];
+        let det = e1[0] * p[0] + e1[1] * p[1] + e1[2] * p[2];
+        if det.abs() < 1e-9 {
+            continue;
+        }
+        let inv = 1.0 / det;
+        let tv = [c[0] - t[0], c[1] - t[1], z - t[2]];
+        let u = (tv[0] * p[0] + tv[1] * p[1] + tv[2] * p[2]) * inv;
+        if !(0.0..=1.0).contains(&u) {
+            continue;
+        }
+        // q = tv x e1
+        let q = [
+            tv[1] * e1[2] - tv[2] * e1[1],
+            tv[2] * e1[0] - tv[0] * e1[2],
+            tv[0] * e1[1] - tv[1] * e1[0],
+        ];
+        let v = (d[0] * q[0] + d[1] * q[1]) * inv;
+        if v < 0.0 || u + v > 1.0 {
+            continue;
+        }
+        let tt = (e2[0] * q[0] + e2[1] * q[1] + e2[2] * q[2]) * inv;
+        if tt > 4.0 && tt < 75.0 && best.map_or(true, |b| tt < b) {
+            best = Some(tt);
+        }
+    }
+    best
+}
+
+/// Ray hits in all 8 directions at height `z`; Some only
+/// when at least 5 directions hit (a surrounding ring).
+fn ring_hits(local: &[&[f32; 9]], c: [f32; 2], z: f32) -> Option<[Option<f32>; 8]> {
+    let mut hits: [Option<f32>; 8] = [None; 8];
+    let mut n = 0;
+    for k in 0..8 {
+        hits[k] = ray_wall(local, c, z, dir8(k));
+        if hits[k].is_some() {
+            n += 1;
+        }
+    }
+    if n >= 6 {
+        Some(hits)
+    } else {
+        None
     }
 }
