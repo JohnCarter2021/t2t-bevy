@@ -1,0 +1,26 @@
+[package]
+name = "t2t"
+version = "0.1.0"
+edition = "2021"
+description = "Prince of Persia: The Two Thrones — clean-room reimplementation in Rust on Bevy. Reads the original game's data files (user's own copy); ships no original assets."
+license = "MIT"
+
+[features]
+# The Bevy game app. Kept behind a feature so the archive tools and tests
+# build with zero system dependencies (no X11/ALSA/udev needed).
+bevy-app = ["dep:bevy"]
+
+[dependencies]
+bevy = { version = "0.16", optional = true }
+
+[[bin]]
+name = "bf_ls"
+path = "src/bin/bf_ls.rs"
+
+[[bin]]
+name = "t2t_game"
+path = "src/bin/t2t_game.rs"
+required-features = ["bevy-app"]
+
+[profile.release]
+lto = "thin"

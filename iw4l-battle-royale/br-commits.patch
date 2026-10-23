@@ -1,0 +1,682 @@
+From 3d3282598a4b68178f830db00bbd565647ade8a0 Mon Sep 17 00:00:00 2001
+From: "Lance (Muse)" <lance@local>
+Date: Thu, 22 Oct 2026 19:26:54 +0530
+Subject: [PATCH 1/3] Battle Royale v1: 100-player cap lift + BR gametype with
+ shrinking zone
+
+---
+ Cargo.lock                                    |   1 +
+ crates/assets/src/br_zone.gsc.txt             | 112 ++++++++++++++++++
+ crates/assets/src/map_scripts.rs              |   2 +
+ crates/assets/src/session_load/match_walk.rs  |   1 +
+ crates/gamemode_iw4/src/br.rs                 |  38 ++++++
+ crates/gamemode_iw4/src/kind.rs               |  20 +++-
+ crates/gamemode_iw4/src/lib.rs                |   1 +
+ crates/hud/src/scorebar.rs                    |  26 ++--
+ crates/master_protocol/src/lib.rs             |   2 +-
+ .../client/presentation/centity_runtime.rs    |   4 +-
+ crates/net/src/transport/master.rs            |   6 +-
+ crates/playerstate_iw4/src/lib.rs             |  10 +-
+ crates/playerstate_iw4/src/third_person.rs    |   6 +-
+ crates/session/Cargo.toml                     |   1 +
+ crates/session/src/match_apply.rs             |  22 +++-
+ crates/sim/src/script/profile/iw4_catalog.rs  |   1 +
+ crates/sim/src/script/profile/iw4_startup.rs  |   5 +
+ crates/sim/src/spawn.rs                       |   3 +-
+ 18 files changed, 228 insertions(+), 33 deletions(-)
+ create mode 100644 crates/assets/src/br_zone.gsc.txt
+ create mode 100644 crates/gamemode_iw4/src/br.rs
+
+diff --git a/Cargo.lock b/Cargo.lock
+index c3e81d9..59d559c 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -6238,6 +6238,7 @@ dependencies = [
+  "hud_iw4",
+  "net",
+  "perf",
++ "playerstate_iw4",
+  "render_frontend",
+  "render_fx",
+  "sim",
+diff --git a/crates/assets/src/br_zone.gsc.txt b/crates/assets/src/br_zone.gsc.txt
+new file mode 100644
+index 0000000..4c47122
+--- /dev/null
++++ b/crates/assets/src/br_zone.gsc.txt
+@@ -0,0 +1,112 @@
++main()
++{
++    if (getdvarint("iw4l_br") != 1)
++        return;
++    thread br_zone_main();
++}
++
++br_zone_main()
++{
++    waittillframeend;
++
++    spawns = getentarray("mp_dm_spawn", "classname");
++    if (!isdefined(spawns) || spawns.size == 0)
++        spawns = getentarray("mp_dm_spawn_start", "classname");
++    if (!isdefined(spawns) || spawns.size == 0)
++        return;
++
++    centre = (0, 0, 0);
++    for (i = 0; i < spawns.size; i++)
++        centre = centre + spawns[i].origin;
++    centre = (centre[0] / spawns.size, centre[1] / spawns.size, centre[2] / spawns.size);
++
++    start_radius = 0;
++    for (i = 0; i < spawns.size; i++)
++    {
++        d = distance2d(spawns[i].origin, centre);
++        if (d > start_radius)
++            start_radius = d;
++    }
++    start_radius = start_radius + 512;
++    if (start_radius < 1024)
++        start_radius = 1024;
++
++    level.br_centre = centre;
++    level.br_radius = start_radius;
++    level.br_started = false;
++
++    level waittill("prematch_over");
++    iprintlnbold("Battle Royale: zone starts shrinking in 60 seconds");
++
++    waits = [];
++    fracs = [];
++    waits[0] = 60; fracs[0] = 0.70;
++    waits[1] = 45; fracs[1] = 0.50;
++    waits[2] = 45; fracs[2] = 0.35;
++    waits[3] = 30; fracs[3] = 0.22;
++    waits[4] = 30; fracs[4] = 0.12;
++    waits[5] = 20; fracs[5] = 0.05;
++
++    thread br_zone_damage();
++    thread br_zone_winner();
++
++    for (p = 0; p < waits.size; p++)
++    {
++        wait waits[p];
++        level.br_radius = start_radius * fracs[p];
++        level.br_started = true;
++        iprintlnbold("The zone has shrunk");
++    }
++}
++
++br_zone_damage()
++{
++    for (;;)
++    {
++        wait 1;
++        if (!isdefined(level.br_started) || !level.br_started)
++            continue;
++        if (!isdefined(level.players))
++            continue;
++        for (i = 0; i < level.players.size; i++)
++        {
++            player = level.players[i];
++            if (!isdefined(player) || !isalive(player))
++                continue;
++            if (distance2d(player.origin, level.br_centre) > level.br_radius)
++                player dodamage(5, player.origin);
++        }
++    }
++}
++
++br_zone_winner()
++{
++    announced = false;
++    for (;;)
++    {
++        wait 2;
++        if (announced)
++            return;
++        if (!isdefined(level.players) || level.players.size < 2)
++            continue;
++        alive = 0;
++        winner = undefined;
++        for (i = 0; i < level.players.size; i++)
++        {
++            player = level.players[i];
++            if (isdefined(player) && isalive(player))
++            {
++                alive++;
++                winner = player;
++            }
++        }
++        if (alive == 1 && isdefined(winner))
++        {
++            announced = true;
++            if (isdefined(winner.name))
++                iprintlnbold(winner.name + " wins the Battle Royale");
++            else
++                iprintlnbold("Battle Royale: we have a winner");
++        }
++    }
++}
+diff --git a/crates/assets/src/map_scripts.rs b/crates/assets/src/map_scripts.rs
+index 47a0028..831ba1a 100644
+--- a/crates/assets/src/map_scripts.rs
++++ b/crates/assets/src/map_scripts.rs
+@@ -1,5 +1,7 @@
+ pub(crate) const BARRELS: &str = include_str!("barrels.gsc.txt");
+ 
++pub(crate) const BR_ZONE: &str = include_str!("br_zone.gsc.txt");
++
+ pub(crate) const T6_EQUIPMENT: &str = include_str!("t6_equipment.gsc.txt");
+ 
+ pub(crate) const RADIATION: &str = r#"main()
+diff --git a/crates/assets/src/session_load/match_walk.rs b/crates/assets/src/session_load/match_walk.rs
+index 50b499a..c8316fa 100644
+--- a/crates/assets/src/session_load/match_walk.rs
++++ b/crates/assets/src/session_load/match_walk.rs
+@@ -295,6 +295,7 @@ pub(super) async fn walk_prepared_match(
+     let mut scripts = iw4_scripts;
+     scripts.overlay(map_scripts);
+     scripts.insert_source("iw4l_maps/barrels", crate::map_scripts::BARRELS.to_owned());
++    scripts.insert_source("iw4l_br/zone", crate::map_scripts::BR_ZONE.to_owned());
+     scripts.insert_source(
+         "iw4l_t6/equipment",
+         crate::map_scripts::T6_EQUIPMENT.to_owned(),
+diff --git a/crates/gamemode_iw4/src/br.rs b/crates/gamemode_iw4/src/br.rs
+new file mode 100644
+index 0000000..ba72aa8
+--- /dev/null
++++ b/crates/gamemode_iw4/src/br.rs
+@@ -0,0 +1,38 @@
++pub const GAMETYPE_TOKEN: &str = "br";
++
++pub const GAMETYPE_DIALOG_LINE: &str = "freeforall";
++
++pub const DISPLAY_NAME: &str = "BATTLE ROYALE";
++
++pub const SCORE_KILL_POINTS: i32 = 50;
++
++pub const SCORE_LIMIT: i32 = 0;
++
++pub const TIME_LIMIT_MS: u32 = 1_200_000;
++
++pub const ROUND_LIMIT: i32 = 1;
++
++pub const NUM_LIVES: i32 = 1;
++
++pub const SPAWN_CLASSNAME: &str = "mp_dm_spawn";
++
++pub const START_SPAWN_CLASSNAME: &str = "mp_dm_spawn_start";
++
++pub const SCRIPT_TOKEN: &str = "dm";
++
++pub const ZONE_DVAR: &str = "iw4l_br";
++
++pub const ZONE_FIRST_WAIT_S: i32 = 60;
++
++pub const ZONE_PHASES: [(i32, f32); 6] = [
++    (60, 0.70),
++    (45, 0.50),
++    (45, 0.35),
++    (30, 0.22),
++    (30, 0.12),
++    (20, 0.05),
++];
++
++pub const ZONE_DAMAGE_PER_TICK: i32 = 5;
++
++pub const ZONE_TICK_S: i32 = 1;
+diff --git a/crates/gamemode_iw4/src/kind.rs b/crates/gamemode_iw4/src/kind.rs
+index 2b5eb67..6d968cd 100644
+--- a/crates/gamemode_iw4/src/kind.rs
++++ b/crates/gamemode_iw4/src/kind.rs
+@@ -1,4 +1,4 @@
+-use crate::{dd, dom, ffa};
++use crate::{br, dd, dom, ffa};
+ 
+ #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+ #[repr(u8)]
+@@ -19,6 +19,8 @@ pub enum GameModeKind {
+     Headquarters = 6,
+ 
+     Sabotage = 7,
++
++    BattleRoyale = 8,
+ }
+ 
+ impl GameModeKind {
+@@ -28,6 +30,10 @@ impl GameModeKind {
+                 Some(Self::FreeForAll)
+             }
+ 
++            b"br" | b"battleroyale" | b"battle_royale" | b"battle-royale" => {
++                Some(Self::BattleRoyale)
++            }
++
+             b"dd" | b"dem" | b"demolition" => Some(Self::Demolition),
+             b"dom" | b"domination" => Some(Self::Domination),
+             b"war" | b"tdm" | b"teamdeathmatch" | b"team_deathmatch" => Some(Self::TeamDeathmatch),
+@@ -61,6 +67,7 @@ impl GameModeKind {
+             Self::CaptureTheFlag => "ctf",
+             Self::Headquarters => "koth",
+             Self::Sabotage => "sab",
++            Self::BattleRoyale => br::GAMETYPE_TOKEN,
+         }
+     }
+ 
+@@ -74,6 +81,7 @@ impl GameModeKind {
+             Self::CaptureTheFlag => &["ctf"],
+             Self::Headquarters => &["koth"],
+             Self::Sabotage => &["sab"],
++            Self::BattleRoyale => &[br::GAMETYPE_TOKEN, br::SCRIPT_TOKEN],
+         }
+     }
+ 
+@@ -91,6 +99,7 @@ impl GameModeKind {
+             5 => Some(Self::CaptureTheFlag),
+             6 => Some(Self::Headquarters),
+             7 => Some(Self::Sabotage),
++            8 => Some(Self::BattleRoyale),
+             _ => None,
+         }
+     }
+@@ -105,11 +114,12 @@ impl GameModeKind {
+             Self::CaptureTheFlag => "CAPTURE THE FLAG",
+             Self::Headquarters => "HEADQUARTERS",
+             Self::Sabotage => "SABOTAGE",
++            Self::BattleRoyale => br::DISPLAY_NAME,
+         }
+     }
+ 
+     pub fn is_team(self) -> bool {
+-        !matches!(self, Self::FreeForAll)
++        !matches!(self, Self::FreeForAll | Self::BattleRoyale)
+     }
+ 
+     pub fn team_start_classname(self, axis: bool) -> Option<&'static str> {
+@@ -119,7 +129,8 @@ impl GameModeKind {
+             | Self::SearchAndDestroy
+             | Self::CaptureTheFlag
+             | Self::Headquarters
+-            | Self::Sabotage => None,
++            | Self::Sabotage
++            | Self::BattleRoyale => None,
+             Self::Domination => Some(if axis {
+                 dom::START_SPAWN_AXIS
+             } else {
+@@ -140,7 +151,8 @@ impl GameModeKind {
+             | Self::SearchAndDestroy
+             | Self::CaptureTheFlag
+             | Self::Headquarters
+-            | Self::Sabotage => &[],
++            | Self::Sabotage
++            | Self::BattleRoyale => &[],
+             Self::Domination => &[dom::SPAWN_CLASSNAME],
+             Self::Demolition => {
+                 if axis {
+diff --git a/crates/gamemode_iw4/src/lib.rs b/crates/gamemode_iw4/src/lib.rs
+index 0e0cf62..f2c732c 100644
+--- a/crates/gamemode_iw4/src/lib.rs
++++ b/crates/gamemode_iw4/src/lib.rs
+@@ -3,6 +3,7 @@
+ 
+ pub mod anchors;
+ pub mod animated_models;
++pub mod br;
+ pub mod damage_feedback;
+ pub mod dd;
+ pub mod dom;
+diff --git a/crates/hud/src/scorebar.rs b/crates/hud/src/scorebar.rs
+index 3885871..d24084a 100644
+--- a/crates/hud/src/scorebar.rs
++++ b/crates/hud/src/scorebar.rs
+@@ -312,33 +312,25 @@ pub(crate) fn update_scorebar(
+         return;
+     };
+ 
+-    let mut others = [0i32; 18];
+-    let mut n_others = 0usize;
++    let mut rank_scores: Vec<i32> = Vec::with_capacity(snap.meta.clients.len());
++    rank_scores.push(local_meta.score);
+     for (id, meta) in &snap.meta.clients {
+         if *id == local.0 {
+             continue;
+         }
+-        if n_others < others.len() {
+-            others[n_others] = meta.score;
+-            n_others += 1;
+-        }
++        rank_scores.push(meta.score);
+     }
+     let now_ms = snap.tick.0.saturating_mul(sim::MATCH_TICK_MS) as i32;
+     let remaining_s = snap.meta.objectives.time_left_ms(now_ms).div_euclid(1000);
+     let sys_ms = milliseconds();
+ 
+-    let mut rank_scores = [0i32; 18];
+-    rank_scores[0] = local_meta.score;
+-    let mut n_ranks = 1usize;
+-    for s in others[..n_others].iter() {
+-        if n_ranks < rank_scores.len() {
+-            rank_scores[n_ranks] = *s;
+-            n_ranks += 1;
+-        }
+-    }
+-    rank_scores[..n_ranks].sort_unstable_by(|a, b| b.cmp(a));
++    rank_scores.sort_unstable_by(|a, b| b.cmp(a));
+     let rank1 = rank_scores[0];
+-    let rank2 = if n_ranks > 1 { rank_scores[1] } else { 0 };
++    let rank2 = if rank_scores.len() > 1 {
++        rank_scores[1]
++    } else {
++        0
++    };
+ 
+     let Some(menu) = catalog.as_ref().and_then(|c| c.get("scorebar_hd")) else {
+         gaps.raise(GapCause::ScorebarNoCatalog);
+diff --git a/crates/master_protocol/src/lib.rs b/crates/master_protocol/src/lib.rs
+index ecb67f9..28ddb90 100644
+--- a/crates/master_protocol/src/lib.rs
++++ b/crates/master_protocol/src/lib.rs
+@@ -16,7 +16,7 @@ pub const MAX_BOOTSTRAP_STREAM_BYTES: usize = 2 + 16 + MAX_BOOTSTRAP_PAYLOAD;
+ 
+ pub const MAX_RELAY_UNI_STREAMS: u32 = 8;
+ pub const MAX_CONCURRENT_BOOTSTRAP: u32 = 4;
+-pub const MAX_SESSION_MEMBERS: u8 = 18;
++pub const MAX_SESSION_MEMBERS: u8 = 100;
+ pub const MAX_ADVERT_NAME_BYTES: usize = 48;
+ pub const MAX_MAP_BYTES: usize = 64;
+ pub const MAX_MODE_BYTES: usize = 24;
+diff --git a/crates/net/src/client/presentation/centity_runtime.rs b/crates/net/src/client/presentation/centity_runtime.rs
+index ed631ed..958ee7c 100644
+--- a/crates/net/src/client/presentation/centity_runtime.rs
++++ b/crates/net/src/client/presentation/centity_runtime.rs
+@@ -162,7 +162,9 @@ pub fn remote_body_submit_kind(
+     if !runtime.in_next_snap() {
+         return RemoteBodySubmitKind::NotInSnap;
+     }
+-    let is_corpse = i32::from(number) >= PLAYER_CORPSE_ENTITY_BASE;
++    let is_corpse = (PLAYER_CORPSE_ENTITY_BASE
++        ..PLAYER_CORPSE_ENTITY_BASE + playerstate_iw4::MAX_CLIENT_CORPSES)
++        .contains(&i32::from(number));
+     if is_corpse {
+         let corpse = runtime.pose_e_type == ET_PLAYER_CORPSE as u8
+             || runtime.next_state.e_type == ET_PLAYER_CORPSE;
+diff --git a/crates/net/src/transport/master.rs b/crates/net/src/transport/master.rs
+index cfede4f..4e941c7 100644
+--- a/crates/net/src/transport/master.rs
++++ b/crates/net/src/transport/master.rs
+@@ -654,7 +654,11 @@ fn parse_max_players() -> Result<u8> {
+         Ok(raw) => {
+             let value = raw.parse::<u8>()?;
+             if !(2..=master_protocol::MAX_SESSION_MEMBERS).contains(&value) {
+-                return Err(format!("IW4L_MASTER_MAX_PLAYERS={value} must be 2..=18").into());
++                return Err(format!(
++                    "IW4L_MASTER_MAX_PLAYERS={value} must be 2..={}",
++                    master_protocol::MAX_SESSION_MEMBERS
++                )
++                .into());
+             }
+             Ok(value)
+         }
+diff --git a/crates/playerstate_iw4/src/lib.rs b/crates/playerstate_iw4/src/lib.rs
+index f7b3f94..354b549 100644
+--- a/crates/playerstate_iw4/src/lib.rs
++++ b/crates/playerstate_iw4/src/lib.rs
+@@ -30,10 +30,10 @@ pub use third_person::{
+     CG_CAMERA_PULLBACK_BOX_HALF, CG_CAMERA_PULLBACK_CLIPMASK, CG_CAMERA_PULLBACK_Z_BIAS,
+     CG_THIRD_PERSON_FOCUS_Z, CG_THIRD_PERSON_PITCH_CLAMP, CG_THIRD_PERSON_PITCH_SCALE,
+     CG_THIRD_PERSON_RANGE_DEFAULT, GENTITY_SPAWN_BASE, LINK_FLAGS_WEAPON_VIEW_ONLY,
+-    MAX_CLIENT_CORPSES, OffsetThirdPersonViewInputs, PLAYER_CORPSE_ENTITY_BASE, PM_TYPE_DEAD,
+-    PM_TYPE_DEAD_LINKED, PM_TYPE_INTERMISSION, PM_TYPE_LAST_STAND, PM_TYPE_NORMAL_LINKED,
+-    PM_TYPE_SPECTATOR, ThirdPersonView, ThirdPersonViewInputs, is_third_person_view,
+-    look_at_killer_yaw, offset_third_person_view, pull_back_camera_through_brush,
+-    viewweapon_frame_runs,
++    MAX_CLIENT_CORPSES, MAX_CLIENTS, OffsetThirdPersonViewInputs, PLAYER_CORPSE_ENTITY_BASE,
++    PM_TYPE_DEAD, PM_TYPE_DEAD_LINKED, PM_TYPE_INTERMISSION, PM_TYPE_LAST_STAND,
++    PM_TYPE_NORMAL_LINKED, PM_TYPE_SPECTATOR, ThirdPersonView, ThirdPersonViewInputs,
++    is_third_person_view, look_at_killer_yaw, offset_third_person_view,
++    pull_back_camera_through_brush, viewweapon_frame_runs,
+ };
+ pub use usercmd::{UserCmd, buttons};
+diff --git a/crates/playerstate_iw4/src/third_person.rs b/crates/playerstate_iw4/src/third_person.rs
+index 35f6c25..eec3d7d 100644
+--- a/crates/playerstate_iw4/src/third_person.rs
++++ b/crates/playerstate_iw4/src/third_person.rs
+@@ -14,9 +14,11 @@ pub const PM_TYPE_DEAD_LINKED: i32 = 9;
+ 
+ pub const PM_TYPE_NORMAL_LINKED: i32 = 1;
+ 
+-pub const MAX_CLIENT_CORPSES: i32 = 8;
++pub const MAX_CLIENTS: i32 = 100;
+ 
+-pub const PLAYER_CORPSE_ENTITY_BASE: i32 = 18;
++pub const MAX_CLIENT_CORPSES: i32 = 100;
++
++pub const PLAYER_CORPSE_ENTITY_BASE: i32 = MAX_CLIENTS;
+ 
+ pub const GENTITY_SPAWN_BASE: i32 = PLAYER_CORPSE_ENTITY_BASE + MAX_CLIENT_CORPSES;
+ 
+diff --git a/crates/session/Cargo.toml b/crates/session/Cargo.toml
+index 1bfd3bf..0d5def0 100644
+--- a/crates/session/Cargo.toml
++++ b/crates/session/Cargo.toml
+@@ -24,6 +24,7 @@ render_frontend.workspace = true
+ render_fx.workspace = true
+ sim.workspace = true
+ gamemode_iw4.workspace = true
++playerstate_iw4.workspace = true
+ clipmap_iw4.workspace = true
+ weapon_iw4.workspace = true
+ xmodel_runtime.workspace = true
+diff --git a/crates/session/src/match_apply.rs b/crates/session/src/match_apply.rs
+index 90c904b..13cf5b6 100644
+--- a/crates/session/src/match_apply.rs
++++ b/crates/session/src/match_apply.rs
+@@ -1240,7 +1240,25 @@ fn preflight_match_install(
+     }
+     script_dvars.push(("mapname".into(), zone.to_owned()));
+     script_dvars.push(("g_gametype".into(), gametype.to_owned()));
+-    script_dvars.push(("sv_maxclients".into(), "18".into()));
++    script_dvars.push((
++        "sv_maxclients".into(),
++        playerstate_iw4::MAX_CLIENTS.to_string(),
++    ));
++    if kind == gamemode_iw4::GameModeKind::BattleRoyale {
++        script_dvars.push((gamemode_iw4::br::ZONE_DVAR.into(), "1".into()));
++        script_dvars.push((
++            format!("scr_{}_numlives", gamemode_iw4::br::SCRIPT_TOKEN),
++            gamemode_iw4::br::NUM_LIVES.to_string(),
++        ));
++        script_dvars.push((
++            format!("scr_{}_scorelimit", gamemode_iw4::br::SCRIPT_TOKEN),
++            gamemode_iw4::br::SCORE_LIMIT.to_string(),
++        ));
++        script_dvars.push((
++            format!("scr_{}_timelimit", gamemode_iw4::br::SCRIPT_TOKEN),
++            (gamemode_iw4::br::TIME_LIMIT_MS / 60_000).to_string(),
++        ));
++    }
+     for (name, value) in rules.map_or(&[][..], |rules| &rules.0) {
+         match script_dvars
+             .iter_mut()
+@@ -1890,11 +1908,13 @@ fn install_clip_and_player(
+             .unwrap_or(match kind {
+                 gamemode_iw4::GameModeKind::Domination => gamemode_iw4::dom::SCORE_LIMIT,
+                 gamemode_iw4::GameModeKind::Demolition => 0,
++                gamemode_iw4::GameModeKind::BattleRoyale => gamemode_iw4::br::SCORE_LIMIT,
+                 _ => sim::FFA.score_limit,
+             }),
+         time_limit_ms: match kind {
+             gamemode_iw4::GameModeKind::Domination => gamemode_iw4::dom::TIME_LIMIT_MS,
+             gamemode_iw4::GameModeKind::Demolition => gamemode_iw4::dd::TIME_LIMIT_MS,
++            gamemode_iw4::GameModeKind::BattleRoyale => gamemode_iw4::br::TIME_LIMIT_MS,
+             _ => sim::FFA.time_limit_ms,
+         },
+         allow_debug_actions,
+diff --git a/crates/sim/src/script/profile/iw4_catalog.rs b/crates/sim/src/script/profile/iw4_catalog.rs
+index b20c091..b4ebb27 100644
+--- a/crates/sim/src/script/profile/iw4_catalog.rs
++++ b/crates/sim/src/script/profile/iw4_catalog.rs
+@@ -337,6 +337,7 @@ pub(super) const IW4: &[Builtin] = &[
+     Builtin::new(Method, "disableusability", Player, false),
+     Builtin::new(Method, "disableweapons", Player, false),
+     Builtin::new(Method, "disableweaponswitch", Player, false),
++    Builtin::new(Method, "dodamage", Entity, false),
+     Builtin::new(Method, "dropitem", PlayerCommand, false),
+     Builtin::new(Method, "dropscavengerbag", PlayerCommand, false),
+     Builtin::new(Method, "enableaimassist", Entity, false),
+diff --git a/crates/sim/src/script/profile/iw4_startup.rs b/crates/sim/src/script/profile/iw4_startup.rs
+index e081e78..6073bf1 100644
+--- a/crates/sim/src/script/profile/iw4_startup.rs
++++ b/crates/sim/src/script/profile/iw4_startup.rs
+@@ -26,6 +26,11 @@ impl Iw4Startup {
+             roots.push(t6_equipment.to_owned());
+             entries.push(format!("{t6_equipment}::main"));
+         }
++        let br_zone = "iw4l_br/zone";
++        if resolver.read_bytes(br_zone).is_ok() {
++            roots.push(br_zone.to_owned());
++            entries.push(format!("{br_zone}::main"));
++        }
+         entries.push(format!("{callbacks}::codecallback_startgametype"));
+         Self { roots, entries }
+     }
+diff --git a/crates/sim/src/spawn.rs b/crates/sim/src/spawn.rs
+index 7f50834..3c2f475 100644
+--- a/crates/sim/src/spawn.rs
++++ b/crates/sim/src/spawn.rs
+@@ -87,7 +87,7 @@ pub struct HostCheats(pub bool);
+ pub struct HostGameModeSelection(GameModeKind);
+ 
+ impl HostGameModeSelection {
+-    pub const ALL: [Self; 8] = [
++    pub const ALL: [Self; 9] = [
+         Self(GameModeKind::FreeForAll),
+         Self(GameModeKind::Domination),
+         Self(GameModeKind::Demolition),
+@@ -96,6 +96,7 @@ impl HostGameModeSelection {
+         Self(GameModeKind::CaptureTheFlag),
+         Self(GameModeKind::Headquarters),
+         Self(GameModeKind::Sabotage),
++        Self(GameModeKind::BattleRoyale),
+     ];
+ 
+     pub fn from_token(token: &str) -> Option<Self> {
+-- 
+2.43.0
+
+
+From c205f08885259792d1f764aa6a5b16addb878657 Mon Sep 17 00:00:00 2001
+From: Lance <lance@local>
+Date: Thu, 22 Oct 2026 23:16:54 +0530
+Subject: [PATCH 2/3] BR v1.1: fix skin-support envelope pricing every actor at
+ largest shapes
+
+check_skin_support priced (largest body x2 + largest weapon x7) x actors;
+at 100 members + 100 corpses the envelope exceeded both the GPU buffer
+limit and any resident budget (max 4 GiB), so rendering readiness refused
+every match ('rendering preparation failed'). Resident shapes are keyed
+by unique model and the runtime residency check prices each distinct
+shape once, so price the full distinct catalog instead. Palettes remain
+actor-scaled. Verified: cargo check -p render_frontend -p launcher clean
+(Linux); Windows run verification pending.
+---
+ .../src/prepare/scene/spawn.rs                | 26 ++++++++++++-------
+ 1 file changed, 16 insertions(+), 10 deletions(-)
+
+diff --git a/crates/render_frontend/src/prepare/scene/spawn.rs b/crates/render_frontend/src/prepare/scene/spawn.rs
+index e5c3d21..c389c9a 100644
+--- a/crates/render_frontend/src/prepare/scene/spawn.rs
++++ b/crates/render_frontend/src/prepare/scene/spawn.rs
+@@ -996,7 +996,6 @@ fn check_skin_support(
+             .collect();
+         let body = body_sizes.iter().copied().max().unwrap_or(0);
+         let weapon = weapon_sizes.iter().copied().max().unwrap_or(0);
+-        let mut fpv_vertices = 0_u64;
+         let mut fpv_parts = 0_u64;
+         for id in 1..=registry.registry().len() as u32 {
+             for axis in [false, true] {
+@@ -1009,19 +1008,26 @@ fn check_skin_support(
+                     .chain(side.ads.iter())
+                     .chain(side.jammed.iter())
+                 {
+-                    let vertices = assembly
+-                        .parts()
+-                        .iter()
+-                        .filter_map(|part| fpv.0.get_at(part.model.order()))
+-                        .map(|part| part.skel.packed_vertices.len() as u64)
+-                        .sum();
+-                    fpv_vertices = fpv_vertices.max(vertices);
+                     fpv_parts = fpv_parts.max(assembly.parts().len() as u64);
+                 }
+             }
+         }
+-        let output = ((body * 2 + weapon * 7) * actors + fpv_vertices) * 32;
+-        let input = ((body * 2 + weapon * 7) * actors + fpv_vertices) * 64;
++        let fpv_vertices_total: u64 = (0..fpv.0.len())
++            .filter_map(|index| fpv.0.get_at(index))
++            .map(|entry| entry.skel.packed_vertices.len() as u64)
++            .sum();
++        // BR fork (100-player cap): resident skinning shapes are keyed by
++        // unique model, and the runtime residency check prices each distinct
++        // shape once — 100 players share the same body models. The stock
++        // envelope priced every actor at the largest body plus seven largest
++        // weapons, which at 200 actors demands more than any GPU budget
++        // admits and refuses every match. Price the whole distinct catalog
++        // instead (a superset of what can be resident at once); palettes stay
++        // actor-scaled because those are per presented actor.
++        let shape_vertices =
++            body_sizes.iter().sum::<u64>() + weapon_sizes.iter().sum::<u64>() + fpv_vertices_total;
++        let output = shape_vertices * 32;
++        let input = shape_vertices * 64;
+         let max_bones = bodies
+             .0
+             .names()
+-- 
+2.43.0
+
+
+From 6f4f0211371683a3359d3b6333a8c8187df6657a Mon Sep 17 00:00:00 2001
+From: Lance <lance@local>
+Date: Thu, 22 Oct 2026 23:32:00 +0530
+Subject: [PATCH 3/3] BR v1.2: envelope residency coefficients mirror the
+ runtime check
+
+His RTX 4060 log (v1.1): envelope output=183406752 input=366813504
+palettes=10385280 budget=1073741824 buffer_limit=4294967295, refused
+ResidencyPressure: (input+palettes)*2 + output*3 = 1.30 GiB > 1 GiB.
+The skinning dispatch's own residency accounting is inputs + transient*2
++ output*2 against the same budget, over presented unique shapes only.
+Price the pre-flight envelope with those coefficients over the full
+distinct catalog: 754,397,568 < 1 GiB default budget, no env var needed.
+---
+ crates/render_frontend/src/prepare/scene/spawn.rs | 12 +++++++++---
+ 1 file changed, 9 insertions(+), 3 deletions(-)
+
+diff --git a/crates/render_frontend/src/prepare/scene/spawn.rs b/crates/render_frontend/src/prepare/scene/spawn.rs
+index c389c9a..332809e 100644
+--- a/crates/render_frontend/src/prepare/scene/spawn.rs
++++ b/crates/render_frontend/src/prepare/scene/spawn.rs
+@@ -1068,11 +1068,17 @@ fn check_skin_support(
+                 world,
+                 render_frame::skinning::SkinRefusal::UnsupportedProduct,
+             );
+-        } else if (input + palettes)
+-            .saturating_mul(2)
+-            .saturating_add(output.saturating_mul(3))
++        } else if input
++            .saturating_add(palettes.saturating_mul(2))
++            .saturating_add(output.saturating_mul(2))
+             > support.resident_budget
+         {
++            // BR fork: coefficients mirror the runtime residency accounting in
++            // the skinning dispatch (unique-shape inputs once, transient
++            // palettes/parameters twice, output buffer twice). The stock
++            // (x2, x3) weighting stays under the default 1 GiB budget only at
++            // the stock catalog scale; with the full distinct catalog priced
++            // in (v1.1) it overstates what the dispatcher itself would refuse.
+             support.refuse(
+                 world,
+                 render_frame::skinning::SkinRefusal::ResidencyPressure,
+-- 
+2.43.0
+

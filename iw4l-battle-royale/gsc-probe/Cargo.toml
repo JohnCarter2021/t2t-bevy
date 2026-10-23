@@ -1,0 +1,9 @@
+[package]
+name = "gsc-probe"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+sim = { path = "../iw4L/crates/sim" }
+
+[workspace]
