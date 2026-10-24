@@ -4,6 +4,7 @@ pub mod bigfile;
 pub mod collision;
 pub mod combat;
 pub mod controller;
+pub mod dare;
 pub mod gao;
 pub mod geometry;
 pub mod material;

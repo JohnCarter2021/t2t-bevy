@@ -111,8 +111,46 @@ BIG reader + `bf_ls` + Bevy boot/index. Verified against the real
   health/sand, checkpoints.
 
 ## M7 — Audio, video, menus
-- Sound banks → Bevy audio; Bink videos replaced by decoded playback;
-  menus/HUD per the original MENU data.
+- [x] Menu shell (2026-10-24): boot into the real Menu3D scene as
+  backdrop + orbit camera + title UI; Enter transitions into
+  gameplay (Phase resource, run_if gates; staging T2T_START=play /
+  T2T_MENU_SECS). Framing measured with menu_probe.
+- [x] Sound banks → Bevy audio (2026-10-24): DARE cracked end-to-end
+  (src/dare.rs, census-clean over all 162 banks); menu music (stream
+  event 0x700000) + Menu_Boot UI sounds wired in t2t_game.
+- [x] Sword-impact foley (2026-10-24): bank TableA is the sound-event
+  catalog; event 0x170024 (weapons' blockSound, proven via
+  fn_PlayBlockImpact) resolves through container TableB 26 to waves
+  27/28/29; any strike_connects hit plays a random variant in game.
+  Verified headless: 47 impact log lines, all 3 variants, 0 panics
+  (out/evidence/foley_fight6.log). Container format corrected the
+  same day: child count @+0x1c, 16-byte {child, weight} entries —
+  the +0x24 read shipped one silent build that played nothing.
+  Other combat foley (swing/hurt/death) still needs proven
+  semantics; the other Amir AI events in bank 003 are unwired.
+- [x] Bink videos replaced by decoded playback (2026-10-24): boot
+  intro sequence (UBISOFT/UBIMC/LOGORP/GO_GEN) via ffmpeg-extracted
+  frame cache (out/video_cache), streamed into a fullscreen image
+  with per-clip audio; Cine/ story clips not yet triggered in-game.
+- [x] World texture binding (2026-10-24): the merged world mesh is
+  split by resolved texture key (Quai: 71 groups, 70 decoded;
+  Menu3D: 53 groups, all decoded) with real DXT/PAL8 textures
+  sampled via StandardMaterial (Repeat wrapping; cutout textures
+  use alpha masking). Verified headless against the old flat-color
+  build: dock props now show plank/striping detail, 0 panics,
+  foley still firing. PAL8 decodes as greyscale (no palette yet);
+  characters/enemies still flat-tinted — their material chain is
+  not resolved by the character loader.
+- [x] Character/enemy texture binding (2026-10-24): each skin's
+  element textures resolve through its owning GAO's grm chain
+  (M_PrinceBare, m_Kaileena, M_Sand_Guard, ...), stack into one
+  atlas (Prince: 3 DXT5 keys -> 512x1088; enemies: 1 key each ->
+  256x256), and the corners' UVs remap into it — the one-mesh
+  animation path is untouched. Verified headless: the flat beige
+  fighters now show skin, cloth and trim detail, 0 panics,
+  foley still firing. PAL8 skins render greyscale (palette not
+  found yet — see NOTES); the Prince is full colour.
+- [ ] Menus/HUD per the original MENU data (beyond the shell).
 
 ## M8 — Campaign parity
 - All sectors wired in original order, scripted events/triggers,

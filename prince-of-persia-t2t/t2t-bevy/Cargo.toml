@@ -8,10 +8,11 @@ license = "MIT"
 [features]
 # The Bevy game app. Kept behind a feature so the archive tools and tests
 # build with zero system dependencies (no X11/ALSA/udev needed).
-bevy-app = ["dep:bevy"]
+bevy-app = ["dep:bevy", "dep:image"]
 
 [dependencies]
-bevy = { version = "0.16", optional = true }
+bevy = { version = "0.16", optional = true, features = ["wav"] }
+image = { version = "0.25", optional = true }
 
 [[bin]]
 name = "bf_ls"

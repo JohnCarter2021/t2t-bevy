@@ -3,27 +3,36 @@
 //! M1: boots Bevy, indexes the original archive.
 //! M3: loads a _wow_ world, builds a Bevy mesh from its largest GEO.
 //! M4: assembles the WHOLE world — every GAO's geometry transformed
-//! by its global matrix into world space, merged into one mesh with
-//! per-corner colours taken from each element's texture average (the
+//! by its global matrix into world space, split into one Bevy mesh
+//! per texture key with the real decoded texture sampled (the
 //! texture-binding chain GAO -> material -> texture is resolved in
-//! t2t::assemble). The scene is centered on the world AABB and scaled
-//! to ~40 units across.
+//! t2t::assemble; faces with no texture render flat grey).
+//! Characters still render flat-tinted: their material chain is
+//! not resolved by the character loader yet. The scene is centered
+//! on the world AABB and scaled to ~40 units across.
 //!
 //! Usage: t2t_game [path-to-pop3.bf] [wow-name-substring]
 //!   defaults: pop3.bf, "Menu3D"
 
 use bevy::asset::RenderAssetUsages;
+use bevy::image::{ImageAddressMode, ImageSampler, ImageSamplerDescriptor};
+use bevy::render::alpha::AlphaMode;
 use bevy::prelude::*;
 use bevy::render::mesh::{Indices, PrimitiveTopology};
+use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
 use bevy::input::mouse::MouseMotion;
 use t2t::assemble::assemble;
 use t2t::bigfile::BigFile;
+use t2t::dare::{decode_sound, decode_sound_from, parse_bank, parse_fat, wav_bytes};
 use t2t::collision::TriangleSoup;
 use t2t::combat::{Fighter, FighterState, SandTank, StrikeProfile};
 use t2t::controller::{Checkpoint, Controller, MoveInput, CLIMB_TIME};
+use t2t::gao::parse_gao;
+use t2t::geometry::parse_geometry;
 use t2t::jade_stream::decompress_entry;
+use t2t::material::texture_key_for;
 use t2t::skin::{posed_verts, ChannelMap, Character, Clip};
-use t2t::texture::decode_texture;
+use t2t::texture::{decode_texture, parse_texture};
 use t2t::wow::walk_wow;
 
 #[derive(Resource)]
@@ -33,15 +42,34 @@ struct GameArchive {
     version: u32,
 }
 
-/// De-indexed mesh data ready for Bevy (positions/normals/uvs/colors
-/// per face corner, sequential indices).
-#[derive(Resource)]
-struct WorldMesh {
+/// One texture's worth of the merged world: de-indexed triangles
+/// sharing a single texture key (None = no texture resolved).
+struct WorldMeshGroup {
+    tex_key: Option<u32>,
     positions: Vec<[f32; 3]>,
     normals: Vec<[f32; 3]>,
     uvs: Vec<[f32; 2]>,
-    colors: Vec<[f32; 4]>,
     indices: Vec<u32>,
+}
+
+/// A decoded world texture, ready to become a Bevy Image.
+struct WorldTexture {
+    key: u32,
+    width: u32,
+    height: u32,
+    rgba: Vec<u8>,
+    /// True when the texture mixes opaque and transparent pixels:
+    /// a cutout (grate, foliage) that needs alpha masking, not
+    /// plain opaque rendering.
+    cutout: bool,
+}
+
+/// De-indexed mesh data ready for Bevy: the merged world split by
+/// texture key, plus the Jade->Bevy frame.
+#[derive(Resource)]
+struct WorldMesh {
+    groups: Vec<WorldMeshGroup>,
+    textures: Vec<WorldTexture>,
     source_name: String,
     tris: usize,
     /// Jade-space center + scale of the world -> Bevy conversion.
@@ -68,6 +96,8 @@ struct EnemySpec {
     /// name-based for cross-rig pool clips).
     map: ChannelMap,
     corners: Vec<(u16, [f32; 2])>,
+    /// Texture atlas for the enemy's skin (None = flat tint).
+    atlas: Option<CharAtlas>,
     move_cycle: Clip,
     pounce: Clip,
     hit: Clip,
@@ -98,6 +128,9 @@ struct CharSpec {
     enemies: Vec<EnemySpec>,
     map: ChannelMap,
     corners: Vec<(u16, [f32; 2])>,
+    /// Texture atlas for the character's skin (None = flat tint).
+    /// Corner UVs are already remapped into it when present.
+    atlas: Option<CharAtlas>,
     /// Jade-space spawn (feet), her real level spot.
     spawn: [f32; 3],
     soup: TriangleSoup,
@@ -223,6 +256,223 @@ fn enemy_fighter() -> Fighter {
 #[derive(Component)]
 struct FollowCam;
 
+/// M7 presentation: the app boots into the main-menu
+/// phase (the game's real Menu3D scene as backdrop, an
+/// orbiting camera, title UI) and transitions into
+/// gameplay on Enter. Staging: T2T_START=play skips the
+/// menu entirely; T2T_MENU_SECS=<s> auto-starts after
+/// s seconds of menu time.
+#[derive(Resource, PartialEq, Eq, Clone, Copy)]
+enum Phase {
+    Menu,
+    Playing,
+}
+
+fn in_menu(phase: Res<Phase>) -> bool {
+    *phase == Phase::Menu
+}
+
+fn in_playing(phase: Res<Phase>) -> bool {
+    *phase == Phase::Playing
+}
+
+/// Entities that belong to the menu presentation.
+#[derive(Component)]
+struct MenuEntity;
+
+/// Entities that belong to the gameplay scene.
+#[derive(Component)]
+struct GameEntity;
+
+/// The Menu3D world prepared separately from the game
+/// sector (None when the game sector IS Menu3D — its
+/// world doubles as the menu backdrop).
+#[derive(Resource)]
+struct MenuWorld(Option<WorldMesh>);
+
+/// Menu-phase bookkeeping: orbit clock, auto-start
+/// timer, and whether a playable character exists.
+#[derive(Resource)]
+struct MenuState {
+    t: f32,
+    auto_secs: Option<f32>,
+    has_char: bool,
+}
+
+/// M7 audio: DARE sounds decoded at startup (prepare
+/// step in main), carried as in-memory WAV bytes. The
+/// picks are grounded in the game's own event data
+/// (usage/t2t.tsv of PopAudioStudio + the bank event
+/// maps): the menu music is stream event 0x700000
+/// (64.0 s stereo @ 24000 Hz, referenced by
+/// MenuInGameAI / Menu_Boot), the UI sounds are bank
+/// 002's Menu_Boot events 0x190002 (boot) and
+/// 0x190007 (confirm).
+#[derive(Resource)]
+struct GameAudio {
+    music_wav: Vec<u8>,
+    ui_boot_wav: Vec<u8>,
+    ui_confirm_wav: Vec<u8>,
+    /// Sword-impact variants: bank 003 event
+    /// 0x170024 — the blockSound every weapon object
+    /// references (container of 3 waves).
+    block_wavs: Vec<Vec<u8>>,
+}
+
+/// Bevy audio asset handles built from GameAudio in
+/// setup.
+#[derive(Resource)]
+struct AudioHandles {
+    music: Handle<AudioSource>,
+    ui_boot: Handle<AudioSource>,
+    ui_confirm: Handle<AudioSource>,
+    block: Vec<Handle<AudioSource>>,
+}
+
+/// The looping menu-music player entity (despawned
+/// on the menu -> playing transition).
+#[derive(Component)]
+struct MusicPlayer;
+
+/// One Bink intro clip, pre-extracted to JPEG frames
+/// + a WAV (ffmpeg decodes Bink 1 natively; the cache
+/// lives in out/video_cache — see prepare_intro).
+struct IntroClip {
+    name: String,
+    frames: Vec<Vec<u8>>,
+    audio_wav: Option<Vec<u8>>,
+}
+
+/// Boot intro state: plays the publisher/title clips
+/// (UBISOFT -> UBIMC -> LOGORP -> GO_GEN, 29.97 fps)
+/// over the menu, then hands over to the menu (music
+/// + boot sound start at the handover). Enter, Space
+/// or a click skips the current clip.
+#[derive(Resource)]
+struct IntroState {
+    active: bool,
+    clips: Vec<IntroClip>,
+    clip: usize,
+    t: f32,
+    shown: usize,
+    started: bool,
+    img: Option<Handle<Image>>,
+    clip_audio: Vec<Option<Handle<AudioSource>>>,
+}
+
+/// The fullscreen intro video node.
+#[derive(Component)]
+struct IntroNode;
+
+/// Load the extracted intro clips from the video
+/// cache (T2T_VIDEO_CACHE, default out/video_cache).
+/// Returns None when the cache is missing or the
+/// intro is staged off (T2T_START=play, T2T_NO_INTRO)
+/// — the game then boots straight into the menu.
+fn prepare_intro(start_playing: bool) -> Option<IntroState> {
+    if start_playing || std::env::var_os("T2T_NO_INTRO").is_some() {
+        return None;
+    }
+    let dir = std::env::var("T2T_VIDEO_CACHE").unwrap_or_else(|_| "out/video_cache".to_string());
+    let base = std::path::Path::new(&dir);
+    let mut clips = Vec::new();
+    for name in ["UBISOFT", "UBIMC", "LOGORP", "GO_GEN"] {
+        let mut frames: Vec<(String, Vec<u8>)> = Vec::new();
+        for e in std::fs::read_dir(base.join(name)).ok()?.flatten() {
+            let p = e.path();
+            if p.extension().map_or(false, |x| x == "jpg") {
+                if let Ok(b) = std::fs::read(&p) {
+                    frames.push((p.file_name().unwrap().to_string_lossy().into_owned(), b));
+                }
+            }
+        }
+        frames.sort();
+        if frames.is_empty() {
+            return None;
+        }
+        clips.push(IntroClip {
+            name: name.to_string(),
+            frames: frames.into_iter().map(|(_, b)| b).collect(),
+            audio_wav: std::fs::read(base.join(format!("{name}.wav"))).ok(),
+        });
+    }
+    println!(
+        "[t2t] intro ready: {} clips, {} frames",
+        clips.len(),
+        clips.iter().map(|c| c.frames.len()).sum::<usize>()
+    );
+    Some(IntroState {
+        active: true,
+        clips,
+        clip: 0,
+        t: 0.0,
+        shown: usize::MAX,
+        started: false,
+        img: None,
+        clip_audio: Vec::new(),
+    })
+}
+
+/// Decode the game's menu audio from the Sound
+/// directory next to pop3.bf. Any failure disables
+/// audio quietly — the game must boot regardless.
+fn prepare_audio(bf_path: &str) -> Option<GameAudio> {
+    use std::io::{Read, Seek, SeekFrom};
+    let sound_dir = std::path::Path::new(bf_path).parent()?.join("Sound");
+    let fat = std::fs::read(sound_dir.join("sound.fat")).ok()?;
+    let entries = parse_fat(&fat);
+    let mut big = std::fs::File::open(sound_dir.join("sound.big")).ok()?;
+    let read_entry = |big: &mut std::fs::File, name: &str| -> Option<Vec<u8>> {
+        let e = entries.iter().find(|x| x.name == name)?;
+        let mut buf = vec![0u8; e.size as usize];
+        big.seek(SeekFrom::Start(e.big_offset as u64)).ok()?;
+        big.read_exact(&mut buf).ok()?;
+        Some(buf)
+    };
+    // Menu UI sounds: bank 002, via its TableA events.
+    let bank002 = read_entry(&mut big, "sound/002.sb0")?;
+    let b2 = parse_bank(&bank002).ok()?;
+    let ui_wav = |event: u32| -> Option<Vec<u8>> {
+        let (_, tb) = b2.events.iter().find(|(id, _)| *id == event)?;
+        let s = b2.sounds.iter().find(|s| s.index == *tb)?;
+        let pcm = decode_sound(&bank002, s).ok()?;
+        Some(wav_bytes(&pcm, s.channels, s.rate))
+    };
+    let ui_boot_wav = ui_wav(0x190002)?;
+    let ui_confirm_wav = ui_wav(0x190007)?;
+    // Combat: bank 003's sword blockSound variants.
+    let block_wavs = (|| -> Option<Vec<Vec<u8>>> {
+        let bank003 = read_entry(&mut big, "sound/003.sb0")?;
+        let b3 = parse_bank(&bank003).ok()?;
+        let mut out = Vec::new();
+        for s in b3.resolve_event(0x170024) {
+            let pcm = decode_sound(&bank003, s).ok()?;
+            out.push(wav_bytes(&pcm, s.channels, s.rate));
+        }
+        Some(out)
+    })()
+    .unwrap_or_default();
+    // Menu music: bank 000's stream track 0x700000.
+    let bank000 = read_entry(&mut big, "sound/000.sb0")?;
+    let b0 = parse_bank(&bank000).ok()?;
+    let track = b0.sounds.iter().find(|s| s.id == 0x700000)?;
+    let soff = track.stream_offset?;
+    let stream = entries.iter().find(|x| x.name == "sound/stream.ss0")?;
+    let mut sec = vec![0u8; (track.sec1_len + track.sec2_len) as usize];
+    big.seek(SeekFrom::Start(stream.big_offset as u64 + soff as u64))
+        .ok()?;
+    big.read_exact(&mut sec).ok()?;
+    let pcm = decode_sound_from(&sec, track).ok()?;
+    let music_wav = wav_bytes(&pcm, track.channels, track.rate);
+    println!(
+        "[t2t] audio ready: menu music event 0x700000 ({:.1}s, {} ch, {} Hz) + UI events 0x190002/0x190007",
+        pcm.len() as f32 / track.channels as f32 / track.rate as f32,
+        track.channels,
+        track.rate
+    );
+    Some(GameAudio { music_wav, ui_boot_wav, ui_confirm_wav, block_wavs })
+}
+
 /// Jade (Z-up, ~100 units per metre) -> Bevy conversion shared
 /// with the world mesh.
 fn jade_to_bevy(p: [f32; 3], center: [f32; 3], s: f32) -> [f32; 3] {
@@ -281,25 +531,6 @@ fn prepare_world(bf_path: &str, wow_name: &str) -> Option<WorldMesh> {
     if world.placed.is_empty() {
         return None;
     }
-    // Texture average colours per key (for vertex colours).
-    let mut avg: std::collections::HashMap<u32, [f32; 4]> = Default::default();
-    for (key, (ti, range)) in &world.textures {
-        let rgba = decode_texture(&data[range.clone()], ti);
-        if !rgba.is_empty() {
-            let mut acc = [0f32; 3];
-            let n = (rgba.len() / 4).max(1);
-            for px in rgba.chunks_exact(4) {
-                acc[0] += px[0] as f32;
-                acc[1] += px[1] as f32;
-                acc[2] += px[2] as f32;
-            }
-            avg.insert(
-                *key,
-                [acc[0] / n as f32 / 255.0, acc[1] / n as f32 / 255.0, acc[2] / n as f32 / 255.0, 1.0],
-            );
-        }
-    }
-
     let (mn, mx) = world.aabb();
     let center = [
         (mn[0] + mx[0]) / 2.0,
@@ -309,11 +540,12 @@ fn prepare_world(bf_path: &str, wow_name: &str) -> Option<WorldMesh> {
     let extent = (mx[0] - mn[0]).max(mx[1] - mn[1]).max(mx[2] - mn[2]).max(1e-6);
     let s = 40.0 / extent;
 
-    let mut positions = Vec::new();
-    let mut normals = Vec::new();
-    let mut uvs = Vec::new();
-    let mut colors = Vec::new();
-    let mut indices = Vec::new();
+    // Split faces by resolved texture key: one Bevy mesh +
+    // material per texture (plus one untextured group). The
+    // texture decode runs once per USED key, not per face.
+    let mut groups: Vec<WorldMeshGroup> = Vec::new();
+    let mut group_of: std::collections::HashMap<Option<u32>, usize> =
+        std::collections::HashMap::new();
     let mut tris = 0usize;
     for placed in &world.placed {
         let geo = &placed.geo;
@@ -338,34 +570,80 @@ fn prepare_world(bf_path: &str, wow_name: &str) -> Option<WorldMesh> {
             ];
             let l = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt().max(1e-9);
             n = [n[0] / l, n[1] / l, n[2] / l];
-            let col = placed
+            let tk = placed
                 .element_textures
                 .get(f[6] as usize)
                 .copied()
-                .flatten()
-                .and_then(|k| avg.get(&k).copied())
-                .unwrap_or([0.6, 0.58, 0.54, 1.0]);
+                .flatten();
+            let gi = *group_of.entry(tk).or_insert_with(|| {
+                groups.push(WorldMeshGroup {
+                    tex_key: tk,
+                    positions: Vec::new(),
+                    normals: Vec::new(),
+                    uvs: Vec::new(),
+                    indices: Vec::new(),
+                });
+                groups.len() - 1
+            });
+            let g = &mut groups[gi];
             for k in 0..3 {
-                positions.push(vpos(f[k]));
-                normals.push(n);
+                g.positions.push(vpos(f[k]));
+                g.normals.push(n);
                 let uvi = f[3 + k] as usize * 2;
                 if uvi + 1 < geo.uvs.len() {
-                    uvs.push([geo.uvs[uvi], geo.uvs[uvi + 1]]);
+                    g.uvs.push([geo.uvs[uvi], geo.uvs[uvi + 1]]);
                 } else {
-                    uvs.push([0.0, 0.0]);
+                    g.uvs.push([0.0, 0.0]);
                 }
-                colors.push(col);
-                indices.push(indices.len() as u32);
+                g.indices.push(g.indices.len() as u32);
             }
         }
     }
+    // Decode each used texture once; a decode that does not
+    // yield exactly w*h*4 bytes (or a missing record) leaves
+    // the group to render in flat grey at spawn time.
+    let mut textures = Vec::new();
+    for g in &groups {
+        if let Some(key) = g.tex_key {
+            if textures.iter().any(|t: &WorldTexture| t.key == key) {
+                continue;
+            }
+            if let Some((ti, range)) = world.textures.get(&key) {
+                let rgba = decode_texture(&data[range.clone()], ti);
+                if rgba.len() == ti.width as usize * ti.height as usize * 4
+                    && ti.width > 0
+                    && ti.height > 0
+                {
+                    let mut opaque = false;
+                    let mut transparent = false;
+                    for px in rgba.chunks_exact(4) {
+                        if px[3] > 250 {
+                            opaque = true;
+                        } else if px[3] < 128 {
+                            transparent = true;
+                        }
+                    }
+                    textures.push(WorldTexture {
+                        key,
+                        width: ti.width,
+                        height: ti.height,
+                        rgba,
+                        cutout: opaque && transparent,
+                    });
+                }
+            }
+        }
+    }
+    println!(
+        "[t2t] world textures: {} groups, {} decoded, {} cutout",
+        groups.len(),
+        textures.len(),
+        textures.iter().filter(|t| t.cutout).count()
+    );
     Some(WorldMesh {
+        groups,
+        textures,
         tris,
-        positions,
-        normals,
-        uvs,
-        colors,
-        indices,
         source_name: bf.file_path(entry),
         center,
         scale: s,
@@ -701,6 +979,148 @@ fn preset_for(wow_name: &str) -> Option<Preset> {
     }
 }
 
+/// A character's textures stacked vertically into one atlas image.
+/// Characters carry only 1-3 textures, so a single-column atlas
+/// keeps the one-mesh-per-character render path untouched: only
+/// the corners' UVs get remapped (face order preserved).
+struct CharAtlas {
+    width: u32,
+    height: u32,
+    rgba: Vec<u8>,
+    cutout: bool,
+}
+
+/// Resolve a skinned GEO's per-element texture keys and decoded
+/// textures from a sector's records: the owning GAO (gro_key ==
+/// geo, or a group record naming it) supplies the grm chain, and
+/// texture records resolve by LAST occurrence — sectors carry a
+/// 56-byte stub before the full record. Returns (per-element
+/// texture keys, decoded (key, w, h, rgba) textures).
+fn char_textures(
+    sector_data: &[u8],
+    geo_key: u32,
+) -> Option<(Vec<Option<u32>>, Vec<(u32, u32, u32, Vec<u8>)>)> {
+    let records = walk_wow(sector_data);
+    let mat_view: std::collections::HashMap<u32, (u32, &[u8])> = records
+        .iter()
+        .filter_map(|r| r.gro_type.map(|g| (r.key, (g, &sector_data[r.data_range()]))))
+        .collect();
+    let geo_rec = records.iter().find(|r| r.key == geo_key)?;
+    let geo = parse_geometry(&sector_data[geo_rec.data_range()]).ok()?;
+    let mut grm = None;
+    for r in &records {
+        if r.tag != ".gao" {
+            continue;
+        }
+        let Some(gao) = parse_gao(&sector_data[r.data_range()]) else {
+            continue;
+        };
+        if gao.grm_key == 0 {
+            continue;
+        }
+        if gao.gro_key == geo_key {
+            grm = Some(gao.grm_key);
+            break;
+        }
+        // Group record: the gro_key's own payload names its members.
+        if let Some((_, gdata)) = mat_view.get(&gao.gro_key) {
+            let mut found = false;
+            let mut o = 0;
+            while o + 4 <= gdata.len() {
+                if u32::from_le_bytes([gdata[o], gdata[o + 1], gdata[o + 2], gdata[o + 3]])
+                    == geo_key
+                {
+                    found = true;
+                    break;
+                }
+                o += 1;
+            }
+            if found {
+                grm = Some(gao.grm_key);
+                break;
+            }
+        }
+    }
+    let grm = grm?;
+    let elem_tex: Vec<Option<u32>> = geo
+        .elements
+        .iter()
+        .map(|(_, mat_id)| texture_key_for(grm, *mat_id, &mat_view))
+        .collect();
+    // Texture records, last occurrence wins (stub, then full).
+    let mut tex_map: std::collections::HashMap<u32, (t2t::texture::TexInfo, std::ops::Range<usize>)> =
+        std::collections::HashMap::new();
+    for r in &records {
+        if let Some(ti) = parse_texture(&sector_data[r.data_range()]) {
+            tex_map.insert(r.key, (ti, r.data_range()));
+        }
+    }
+    let mut decoded = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for tk in elem_tex.iter().flatten() {
+        if !seen.insert(*tk) {
+            continue;
+        }
+        if let Some((ti, range)) = tex_map.get(tk) {
+            let rgba = decode_texture(&sector_data[range.clone()], ti);
+            if rgba.len() == ti.width as usize * ti.height as usize * 4
+                && ti.width > 0
+                && ti.height > 0
+            {
+                decoded.push((*tk, ti.width, ti.height, rgba));
+            }
+        }
+    }
+    Some((elem_tex, decoded))
+}
+
+/// Stack decoded textures into one atlas (single column, key
+/// order). Returns the atlas plus each key's rect (x, y, w, h).
+/// PAL8 textures arrive as greyscale (no palette found yet) —
+/// their detail is real, their colour is not.
+fn build_char_atlas(
+    decoded: &[(u32, u32, u32, Vec<u8>)],
+) -> Option<(CharAtlas, std::collections::HashMap<u32, (u32, u32, u32, u32)>)> {
+    if decoded.is_empty() {
+        return None;
+    }
+    let mut sorted: Vec<(u32, u32, u32, Vec<u8>)> = decoded.to_vec();
+    sorted.sort_by_key(|(k, _, _, _)| *k);
+    let width = sorted.iter().map(|(_, w, _, _)| *w).max()?;
+    let height: u32 = sorted.iter().map(|(_, _, h, _)| *h).sum();
+    let mut rgba = vec![0u8; width as usize * height as usize * 4];
+    let mut rects = std::collections::HashMap::new();
+    let mut y = 0u32;
+    for (key, w, h, px) in &sorted {
+        for row in 0..*h as usize {
+            let dst = ((y as usize + row) * width as usize) * 4;
+            let src = row * *w as usize * 4;
+            rgba[dst..dst + *w as usize * 4]
+                .copy_from_slice(&px[src..src + *w as usize * 4]);
+        }
+        rects.insert(*key, (0, y, *w, *h));
+        y += *h;
+    }
+    let mut opaque = false;
+    let mut transparent = false;
+    for px in rgba.chunks_exact(4) {
+        if px[3] > 250 {
+            opaque = true;
+        } else if px[3] < 128 {
+            transparent = true;
+        }
+    }
+    Some((
+        CharAtlas {
+            width,
+            height,
+            rgba,
+            cutout: opaque && transparent,
+        },
+        rects,
+    ))
+}
+
 fn prepare_character(bf_path: &str, wow_name: &str, world: &WorldMesh) -> Option<CharSpec> {
     let preset = preset_for(wow_name)?;
     let bf = BigFile::open(bf_path).ok()?;
@@ -781,10 +1201,39 @@ fn prepare_character(bf_path: &str, wow_name: &str, world: &WorldMesh) -> Option
                 ecorners.push((f[k], uv));
             }
         }
+        // Same atlas treatment as the player skin.
+        let mut eatlas = None;
+        if let Some((eelem_tex, edecoded)) =
+            char_textures(&rig_data, e.geo).or_else(|| char_textures(&edata, e.geo))
+        {
+            if let Some((eat, erect)) = build_char_atlas(&edecoded) {
+                for (fi, f) in ech.faces.iter().enumerate() {
+                    let tk = eelem_tex.get(f[6] as usize).copied().flatten();
+                    if let Some((rx, ry, rw, rh)) = tk.and_then(|k| erect.get(&k)) {
+                        for k in 0..3 {
+                            let c = &mut ecorners[fi * 3 + k];
+                            c.1 = [
+                                (*rx as f32 + c.1[0] * *rw as f32) / eat.width as f32,
+                                (*ry as f32 + c.1[1] * *rh as f32) / eat.height as f32,
+                            ];
+                        }
+                    }
+                }
+                println!(
+                    "[t2t] character textures: {} ({} keys -> atlas {}x{})",
+                    e.name,
+                    edecoded.len(),
+                    eat.width,
+                    eat.height
+                );
+                eatlas = Some(eat);
+            }
+        }
         enemies.push(EnemySpec {
             ch: ech,
             map: emap,
             corners: ecorners,
+            atlas: eatlas,
             move_cycle: eget(e.clips.0)?,
             pounce: eget(e.clips.1)?,
             hit: eget(e.clips.2)?,
@@ -822,6 +1271,36 @@ fn prepare_character(bf_path: &str, wow_name: &str, world: &WorldMesh) -> Option
                 [0.0, 0.0]
             };
             corners.push((f[k], uv));
+        }
+    }
+    // Texture atlas: resolve the skin's element textures, stack
+    // them, and remap the corners' UVs into the atlas (face
+    // order preserved, so skinned positions stay aligned).
+    let mut atlas = None;
+    if let Some((elem_tex, decoded)) =
+        char_textures(&rig_data, preset.geo).or_else(|| char_textures(&data, preset.geo))
+    {
+        if let Some((at, rects)) = build_char_atlas(&decoded) {
+            for (fi, f) in ch.faces.iter().enumerate() {
+                let tk = elem_tex.get(f[6] as usize).copied().flatten();
+                if let Some((rx, ry, rw, rh)) = tk.and_then(|k| rects.get(&k)) {
+                    for k in 0..3 {
+                        let c = &mut corners[fi * 3 + k];
+                        c.1 = [
+                            (*rx as f32 + c.1[0] * *rw as f32) / at.width as f32,
+                            (*ry as f32 + c.1[1] * *rh as f32) / at.height as f32,
+                        ];
+                    }
+                }
+            }
+            println!(
+                "[t2t] character textures: {} ({} keys -> atlas {}x{})",
+                preset.name,
+                decoded.len(),
+                at.width,
+                at.height
+            );
+            atlas = Some(at);
         }
     }
     // The character's real level spot: the anchor GAO's AABB
@@ -932,6 +1411,7 @@ fn prepare_character(bf_path: &str, wow_name: &str, world: &WorldMesh) -> Option
         enemies,
         map,
         corners,
+        atlas,
         spawn,
         soup,
         center: world.center,
@@ -944,7 +1424,9 @@ fn prepare_character(bf_path: &str, wow_name: &str, world: &WorldMesh) -> Option
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 fn animate_char(
+    mut commands: Commands,
     time: Res<Time>,
     keys: Res<ButtonInput<KeyCode>>,
     mouse_buttons: Res<ButtonInput<MouseButton>>,
@@ -955,6 +1437,7 @@ fn animate_char(
     mut q_enemy: Query<&mut EnemyChar>,
     mut q_hud: Query<&mut Text, With<HudText>>,
     mut cam: Query<&mut Transform, With<FollowCam>>,
+    audio_handles: Option<Res<AudioHandles>>,
 ) {
     let dt = time.delta_secs().min(0.05);
     for mut ac in &mut q {
@@ -1185,6 +1668,10 @@ fn animate_char(
     // ---- Combat: strikes, the enemy AI, respawn, HUD ----
     if !spec.enemies.is_empty() {
         let mut foes: Vec<Mut<EnemyChar>> = q_enemy.iter_mut().collect();
+        // A weapon strike landing this frame (either
+        // direction) plays the blockSound (bank 003
+        // event 0x170024, a random variant).
+        let mut landed = false;
         let mut hud = String::new();
         // Enemies live on world time: slowed while the
         // Prince's slow motion runs.
@@ -1208,7 +1695,9 @@ fn animate_char(
             // on the attacker).
             if let Ok(mut ac) = q.single_mut() {
                 let (pp, py) = (ac.ctl.pos, ac.ctl.yaw);
-                ac.fighter.strike_connects(pp, py, epos, &mut ec.fighter);
+                if ac.fighter.strike_connects(pp, py, epos, &mut ec.fighter) {
+                    landed = true;
+                }
             }
             let to_player = [p_pos[0] - epos[0], p_pos[1] - epos[1]];
             let dist = (to_player[0] * to_player[0] + to_player[1] * to_player[1]).sqrt();
@@ -1236,7 +1725,9 @@ fn animate_char(
                 FighterState::Attacking { t, .. } => {
                     if let Ok(mut ac) = q.single_mut() {
                         let (pp, ey) = (ac.ctl.pos, ec.ctl.yaw);
-                        ec.fighter.strike_connects(epos, ey, pp, &mut ac.fighter);
+                        if ec.fighter.strike_connects(epos, ey, pp, &mut ac.fighter) {
+                            landed = true;
+                        }
                     }
                     let f = (t / ec.fighter.strike.duration * (e_spec.pounce.max_frame + 1) as f32) as u32;
                     (&e_spec.pounce, f.min(e_spec.pounce.max_frame))
@@ -1280,6 +1771,15 @@ fn animate_char(
                 e_spec.name, ec.fighter.hp, ec.fighter.max_hp
             ));
         }
+        if landed {
+            if let Some(h) = &audio_handles {
+                if !h.block.is_empty() {
+                    let pick = (time.elapsed_secs() * 7.31) as usize % h.block.len();
+                    commands.spawn((AudioPlayer(h.block[pick].clone()), PlaybackSettings::DESPAWN));
+                    println!("[t2t] audio: sword impact (event 0x170024 variant {})", pick + 1);
+                }
+            }
+        }
         // Player death -> reset the whole fight.
         if let Ok(mut ac) = q.single_mut() {
             if ac.fighter.state == FighterState::Dead {
@@ -1316,6 +1816,107 @@ fn animate_char(
     }
 }
 
+/// Build one Bevy mesh + material per world texture group: real
+/// sampled textures replace the old per-element average colours.
+/// Groups without a decoded texture fall back to flat grey.
+fn world_group_assets(
+    w: &WorldMesh,
+    meshes: &mut Assets<Mesh>,
+    materials: &mut Assets<StandardMaterial>,
+    images: &mut Assets<Image>,
+) -> Vec<(Handle<Mesh>, Handle<StandardMaterial>)> {
+    let mut tex_handles: std::collections::HashMap<u32, Handle<Image>> =
+        std::collections::HashMap::new();
+    for t in &w.textures {
+        let mut img = Image::new(
+            Extent3d {
+                width: t.width,
+                height: t.height,
+                depth_or_array_layers: 1,
+            },
+            TextureDimension::D2,
+            t.rgba.clone(),
+            TextureFormat::Rgba8UnormSrgb,
+            RenderAssetUsages::default(),
+        );
+        // Jade UVs tile past [0, 1] on walls and floors.
+        img.sampler = ImageSampler::Descriptor(ImageSamplerDescriptor {
+            address_mode_u: ImageAddressMode::Repeat,
+            address_mode_v: ImageAddressMode::Repeat,
+            ..Default::default()
+        });
+        tex_handles.insert(t.key, images.add(img));
+    }
+    w.groups
+        .iter()
+        .map(|g| {
+            let mut mesh = Mesh::new(
+                PrimitiveTopology::TriangleList,
+                RenderAssetUsages::default(),
+            );
+            mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, g.positions.clone());
+            mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, g.normals.clone());
+            mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, g.uvs.clone());
+            mesh.insert_indices(Indices::U32(g.indices.clone()));
+            let mat = match g.tex_key.and_then(|k| tex_handles.get(&k)) {
+                Some(h) => {
+                    let cutout = w
+                        .textures
+                        .iter()
+                        .find(|t| Some(t.key) == g.tex_key)
+                        .map_or(false, |t| t.cutout);
+                    StandardMaterial {
+                        base_color: Color::WHITE,
+                        base_color_texture: Some(h.clone()),
+                        alpha_mode: if cutout {
+                            AlphaMode::Mask(0.5)
+                        } else {
+                            AlphaMode::Opaque
+                        },
+                        ..default()
+                    }
+                }
+                None => StandardMaterial {
+                    base_color: Color::srgb(0.6, 0.58, 0.54),
+                    ..default()
+                },
+            };
+            (meshes.add(mesh), materials.add(mat))
+        })
+        .collect()
+}
+
+/// Material for a character atlas. The image keeps Bevy's
+/// default sampler (ClampToEdge): an atlas must not repeat,
+/// or faces would sample neighbouring stacked textures.
+fn char_atlas_material(
+    at: &CharAtlas,
+    materials: &mut Assets<StandardMaterial>,
+    images: &mut Assets<Image>,
+) -> Handle<StandardMaterial> {
+    let img = Image::new(
+        Extent3d {
+            width: at.width,
+            height: at.height,
+            depth_or_array_layers: 1,
+        },
+        TextureDimension::D2,
+        at.rgba.clone(),
+        TextureFormat::Rgba8UnormSrgb,
+        RenderAssetUsages::default(),
+    );
+    materials.add(StandardMaterial {
+        base_color: Color::WHITE,
+        base_color_texture: Some(images.add(img)),
+        alpha_mode: if at.cutout {
+            AlphaMode::Mask(0.5)
+        } else {
+            AlphaMode::Opaque
+        },
+        ..default()
+    })
+}
+
 fn setup(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
@@ -1323,7 +1924,28 @@ fn setup(
     archive: Option<Res<GameArchive>>,
     world: Option<Res<WorldMesh>>,
     char_spec: Option<Res<CharSpec>>,
+    phase: Option<Res<Phase>>,
+    menu_world: Option<Res<MenuWorld>>,
+    audio: Option<Res<GameAudio>>,
+    mut audio_assets: ResMut<Assets<AudioSource>>,
+    intro: Option<ResMut<IntroState>>,
+    mut images: ResMut<Assets<Image>>,
 ) {
+    // M7: in menu phase the gameplay scene starts hidden
+    // behind the Menu3D backdrop; the transition flips
+    // visibility (menu_update).
+    let in_menu_start = matches!(phase.as_deref(), Some(Phase::Menu));
+    let separate_menu = menu_world.as_deref().map_or(false, |m| m.0.is_some());
+    let game_vis = if in_menu_start && separate_menu {
+        Visibility::Hidden
+    } else {
+        Visibility::Inherited
+    };
+    let ui_vis = if in_menu_start {
+        Visibility::Inherited
+    } else {
+        Visibility::Hidden
+    };
     if let Some(a) = archive {
         println!(
             "[t2t] engine ready — BIG v{}, {} files, {} dirs indexed",
@@ -1332,25 +1954,20 @@ fn setup(
     }
     if let Some(w) = world {
         println!(
-            "[t2t] world mesh: {} ({} tris, {} corners)",
+            "[t2t] world mesh: {} ({} tris, {} texture groups)",
             w.source_name,
             w.tris,
-            w.positions.len()
+            w.groups.len()
         );
-        let mut mesh = Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::default());
-        mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, w.positions.clone());
-        mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, w.normals.clone());
-        mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, w.uvs.clone());
-        mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, w.colors.clone());
-        mesh.insert_indices(Indices::U32(w.indices.clone()));
-        commands.spawn((
-            Mesh3d(meshes.add(mesh)),
-            MeshMaterial3d(materials.add(StandardMaterial {
-                base_color: Color::WHITE,
-                ..default()
-            })),
-            Transform::default(),
-        ));
+        for (mesh_h, mat_h) in world_group_assets(&w, &mut meshes, &mut materials, &mut images) {
+            commands.spawn((
+                Mesh3d(mesh_h),
+                MeshMaterial3d(mat_h),
+                Transform::default(),
+                GameEntity,
+                game_vis,
+            ));
+        }
     }
     if let Some(spec) = char_spec {
         let (positions, normals) = char_corners(
@@ -1371,12 +1988,23 @@ fn setup(
             Mesh::ATTRIBUTE_UV_0,
             spec.corners.iter().map(|c| c.1).collect::<Vec<_>>(),
         );
-        mesh.insert_attribute(
-            Mesh::ATTRIBUTE_COLOR,
-            vec![[0.85f32, 0.79, 0.7, 1.0]; n],
-        );
+        // Textured skins need no vertex tint; flat fallback
+        // keeps the old beige.
+        if spec.atlas.is_none() {
+            mesh.insert_attribute(
+                Mesh::ATTRIBUTE_COLOR,
+                vec![[0.85f32, 0.79, 0.7, 1.0]; n],
+            );
+        }
         mesh.insert_indices(Indices::U32((0..n as u32).collect()));
         let handle = meshes.add(mesh);
+        let player_mat = match &spec.atlas {
+            Some(at) => char_atlas_material(at, &mut materials, &mut images),
+            None => materials.add(StandardMaterial {
+                base_color: Color::WHITE,
+                ..default()
+            }),
+        };
         println!(
             "[t2t] character: {}, clip {:#010x} ({} frames, {} corners)",
             spec.name,
@@ -1399,11 +2027,10 @@ fn setup(
         }
         commands.spawn((
             Mesh3d(handle.clone()),
-            MeshMaterial3d(materials.add(StandardMaterial {
-                base_color: Color::WHITE,
-                ..default()
-            })),
+            MeshMaterial3d(player_mat),
             Transform::default(),
+            GameEntity,
+            game_vis,
             AnimatedChar {
                 mesh: handle,
                 time: 0.0,
@@ -1441,20 +2068,28 @@ fn setup(
                 Mesh::ATTRIBUTE_UV_0,
                 e.corners.iter().map(|c| c.1).collect::<Vec<_>>(),
             );
-            emesh.insert_attribute(
-                Mesh::ATTRIBUTE_COLOR,
-                vec![[0.72f32, 0.62, 0.5, 1.0]; en_n],
-            );
+            if e.atlas.is_none() {
+                emesh.insert_attribute(
+                    Mesh::ATTRIBUTE_COLOR,
+                    vec![[0.72f32, 0.62, 0.5, 1.0]; en_n],
+                );
+            }
             emesh.insert_indices(Indices::U32((0..en_n as u32).collect()));
             let ehandle = meshes.add(emesh);
+            let enemy_mat = match &e.atlas {
+                Some(at) => char_atlas_material(at, &mut materials, &mut images),
+                None => materials.add(StandardMaterial {
+                    base_color: Color::WHITE,
+                    ..default()
+                }),
+            };
             println!("[t2t] enemy: {} ({} corners)", e.name, en_n);
             commands.spawn((
                 Mesh3d(ehandle.clone()),
-                MeshMaterial3d(materials.add(StandardMaterial {
-                    base_color: Color::WHITE,
-                    ..default()
-                })),
+                MeshMaterial3d(enemy_mat),
                 Transform::default(),
+                GameEntity,
+                game_vis,
                 EnemyChar {
                     idx,
                     mesh: ehandle,
@@ -1479,9 +2114,69 @@ fn setup(
                     ..default()
                 },
                 HudText,
+                GameEntity,
+                game_vis,
             ));
         }
     }
+    // M7: the menu backdrop (the game's real Menu3D
+    // scene) + title UI.
+    if let Some(mw) = menu_world.as_deref() {
+        if let Some(w) = &mw.0 {
+            println!(
+                "[t2t] menu backdrop: {} ({} tris, {} texture groups)",
+                w.source_name,
+                w.tris,
+                w.groups.len()
+            );
+            for (mesh_h, mat_h) in world_group_assets(w, &mut meshes, &mut materials, &mut images) {
+                commands.spawn((
+                    Mesh3d(mesh_h),
+                    MeshMaterial3d(mat_h),
+                    Transform::default(),
+                    MenuEntity,
+                    ui_vis,
+                ));
+            }
+        }
+    }
+    commands
+        .spawn((
+            Node {
+                position_type: PositionType::Absolute,
+                top: Val::Percent(16.0),
+                left: Val::Percent(0.0),
+                width: Val::Percent(100.0),
+                flex_direction: FlexDirection::Column,
+                align_items: AlignItems::Center,
+                row_gap: Val::Px(10.0),
+                ..default()
+            },
+            MenuEntity,
+            ui_vis,
+        ))
+        .with_children(|p| {
+            p.spawn((
+                Text::new("PRINCE OF PERSIA"),
+                TextFont { font_size: 54.0, ..default() },
+                TextColor(Color::srgb(0.92, 0.85, 0.68)),
+            ));
+            p.spawn((
+                Text::new("T H E   T W O   T H R O N E S"),
+                TextFont { font_size: 27.0, ..default() },
+                TextColor(Color::srgb(0.75, 0.68, 0.55)),
+            ));
+            p.spawn((
+                Text::new("Press ENTER to start"),
+                TextFont { font_size: 22.0, ..default() },
+                TextColor(Color::WHITE),
+            ));
+            p.spawn((
+                Text::new("WASD move \u{00b7} Space jump \u{00b7} F attack \u{00b7} R sand slow-motion"),
+                TextFont { font_size: 15.0, ..default() },
+                TextColor(Color::srgb(0.6, 0.6, 0.62)),
+            ));
+        });
     commands.spawn((
         Camera3d::default(),
         Transform::from_xyz(26.0, 16.0, 34.0).looking_at(Vec3::ZERO, Vec3::Y),
@@ -1499,6 +2194,216 @@ fn setup(
         brightness: 400.0,
         affects_lightmapped_meshes: false,
     });
+    // M7 audio: register the decoded sounds; in the
+    // menu phase start the looping music + boot sound
+    // (deferred to the intro handover when the boot
+    // intro is active).
+    let intro_active = intro.as_ref().map_or(false, |i| i.active);
+    if let Some(a) = audio {
+        let handles = AudioHandles {
+            music: audio_assets.add(AudioSource { bytes: a.music_wav.clone().into() }),
+            ui_boot: audio_assets.add(AudioSource { bytes: a.ui_boot_wav.clone().into() }),
+            ui_confirm: audio_assets.add(AudioSource {
+                bytes: a.ui_confirm_wav.clone().into(),
+            }),
+            block: a
+                .block_wavs
+                .iter()
+                .map(|w| audio_assets.add(AudioSource { bytes: w.clone().into() }))
+                .collect(),
+        };
+        if in_menu_start && !intro_active {
+            commands.spawn((
+                AudioPlayer(handles.music.clone()),
+                PlaybackSettings {
+                    volume: bevy::audio::Volume::Decibels(-6.0),
+                    ..PlaybackSettings::LOOP
+                },
+                MusicPlayer,
+            ));
+            commands.spawn((AudioPlayer(handles.ui_boot.clone()), PlaybackSettings::ONCE));
+            println!("[t2t] audio: menu music + boot sound playing (event 0x190002)");
+        }
+        commands.insert_resource(handles);
+    }
+    // M7 intro: fullscreen video node + clip audio.
+    if let Some(mut st) = intro {
+        if st.active {
+            let img = images.add(Image::new_fill(
+                bevy::render::render_resource::Extent3d {
+                    width: 800,
+                    height: 600,
+                    depth_or_array_layers: 1,
+                },
+                bevy::render::render_resource::TextureDimension::D2,
+                &[0, 0, 0, 255],
+                bevy::render::render_resource::TextureFormat::Rgba8UnormSrgb,
+                RenderAssetUsages::default(),
+            ));
+            let mut ch = Vec::new();
+            for c in &st.clips {
+                ch.push(
+                    c.audio_wav
+                        .as_ref()
+                        .map(|w| audio_assets.add(AudioSource { bytes: w.clone().into() })),
+                );
+            }
+            st.clip_audio = ch;
+            st.img = Some(img.clone());
+            commands.spawn((
+                Node {
+                    width: Val::Percent(100.0),
+                    height: Val::Percent(100.0),
+                    position_type: PositionType::Absolute,
+                    ..default()
+                },
+                ImageNode::new(img),
+                MenuEntity,
+                IntroNode,
+                GlobalZIndex(10),
+            ));
+            println!("[t2t] intro: playing UBISOFT (Enter skips)");
+        }
+    }
+}
+
+/// Boot intro playback: advance the current clip at
+/// 29.97 fps, uploading each new JPEG frame into the
+/// shared image; play the clip's audio at its start.
+/// Enter / Space / click skips the clip. After the
+/// last clip, hide the node and start the menu audio
+/// (the handover setup deferred).
+#[allow(clippy::too_many_arguments)]
+fn intro_update(
+    mut commands: Commands,
+    time: Res<Time>,
+    keys: Res<ButtonInput<KeyCode>>,
+    mouse: Res<ButtonInput<MouseButton>>,
+    intro: Option<ResMut<IntroState>>,
+    mut images: ResMut<Assets<Image>>,
+    audio_handles: Option<Res<AudioHandles>>,
+    mut node_q: Query<&mut Visibility, With<IntroNode>>,
+) {
+    let Some(mut intro) = intro else {
+        return;
+    };
+    if !intro.active {
+        return;
+    }
+    intro.t += time.delta_secs();
+    let skip = keys.just_pressed(KeyCode::Enter)
+        || keys.just_pressed(KeyCode::Space)
+        || mouse.just_pressed(MouseButton::Left);
+    let clip_len = intro.clips[intro.clip].frames.len();
+    let frame = (intro.t * 29.97) as usize;
+    if skip || frame >= clip_len {
+        intro.clip += 1;
+        intro.t = 0.0;
+        intro.shown = usize::MAX;
+        intro.started = false;
+        if intro.clip >= intro.clips.len() {
+            intro.active = false;
+            for mut v in &mut node_q {
+                *v = Visibility::Hidden;
+            }
+            if let Some(h) = audio_handles {
+                commands.spawn((
+                    AudioPlayer(h.music.clone()),
+                    PlaybackSettings {
+                        volume: bevy::audio::Volume::Decibels(-6.0),
+                        ..PlaybackSettings::LOOP
+                    },
+                    MusicPlayer,
+                ));
+                commands.spawn((AudioPlayer(h.ui_boot.clone()), PlaybackSettings::ONCE));
+                println!("[t2t] intro done -> menu (music + boot sound)");
+            }
+            return;
+        }
+        println!("[t2t] intro: {}", intro.clips[intro.clip].name);
+        return;
+    }
+    if !intro.started {
+        intro.started = true;
+        if let Some(Some(h)) = intro.clip_audio.get(intro.clip) {
+            let h = h.clone();
+            commands.spawn((AudioPlayer(h), PlaybackSettings::DESPAWN));
+        }
+    }
+    if frame != intro.shown {
+        intro.shown = frame;
+        let jpeg = intro.clips[intro.clip].frames.get(frame).cloned();
+        if let (Some(jpeg), Some(handle)) = (jpeg, intro.img.clone()) {
+            if let Ok(dynimg) = image::load_from_memory(&jpeg) {
+                let rgba = dynimg.to_rgba8();
+                if rgba.width() == 800 && rgba.height() == 600 {
+                    if let Some(img) = images.get_mut(&handle) {
+                        img.data = Some(rgba.into_raw());
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Menu phase: slowly orbit the Menu3D backdrop and
+/// watch for the start signal (Enter, or the staged
+/// T2T_MENU_SECS timer). On start, hide the menu
+/// presentation, reveal the gameplay scene, and hand
+/// the camera to animate_char.
+fn menu_update(
+    mut commands: Commands,
+    time: Res<Time>,
+    keys: Res<ButtonInput<KeyCode>>,
+    mut phase: ResMut<Phase>,
+    mut state: ResMut<MenuState>,
+    mut cam: Query<&mut Transform, With<FollowCam>>,
+    mut menu_q: Query<&mut Visibility, (With<MenuEntity>, Without<GameEntity>)>,
+    mut game_q: Query<&mut Visibility, (With<GameEntity>, Without<MenuEntity>)>,
+    audio_handles: Option<Res<AudioHandles>>,
+    music_q: Query<Entity, With<MusicPlayer>>,
+) {
+    state.t += time.delta_secs();
+    // Menu3D is a skybox ring (~40 across) around a
+    // small central island — the camera must orbit
+    // INSIDE the ring, close to the island, or the
+    // near panorama panel occludes everything. Framing
+    // from menu_probe: the island mass sits at Bevy
+    // y ~ -4.8 (centroid x -0.5, z 1.0), structures
+    // rising to ~-1; orbit just above the island plane.
+    let a = state.t * 0.07;
+    for mut t in &mut cam {
+        *t = Transform::from_xyz(
+            -0.5 + a.cos() * 10.0,
+            -2.2 + (state.t * 0.23).sin() * 0.6,
+            1.0 + a.sin() * 10.0,
+        )
+        .looking_at(Vec3::new(-0.5, -3.0, 1.0), Vec3::Y);
+    }
+    let auto = state.auto_secs.map_or(false, |s| state.t >= s);
+    if keys.just_pressed(KeyCode::Enter) || auto {
+        if !state.has_char {
+            println!("[t2t] menu: no playable sector loaded (start ignored)");
+            state.auto_secs = None;
+            return;
+        }
+        println!("[t2t] menu -> playing");
+        // Stop the menu music; play the confirm sound.
+        if let Some(h) = audio_handles {
+            for e in &music_q {
+                commands.entity(e).despawn();
+            }
+            commands.spawn((AudioPlayer(h.ui_confirm.clone()), PlaybackSettings::ONCE));
+            println!("[t2t] audio: music stopped, confirm sound (event 0x190007)");
+        }
+        for mut v in &mut menu_q {
+            *v = Visibility::Hidden;
+        }
+        for mut v in &mut game_q {
+            *v = Visibility::Visible;
+        }
+        *phase = Phase::Playing;
+    }
 }
 
 fn main() {
@@ -1541,9 +2446,45 @@ fn main() {
         eprintln!("[t2t] no parseable geometry found in wow matching '{wow_name}'");
     }
 
+    // M7: boot into the menu phase unless staging says
+    // otherwise; the Menu3D world is the backdrop (when
+    // the game sector IS Menu3D it doubles as both).
+    let start_playing = std::env::var("T2T_START").map_or(false, |v| v == "play");
+    app.insert_resource(if start_playing {
+        Phase::Playing
+    } else {
+        Phase::Menu
+    });
+    let menu_world = if wow_name.contains("Menu3D") {
+        None
+    } else {
+        prepare_world(&bf_path, "Menu3D")
+    };
+    app.insert_resource(MenuWorld(menu_world));
+    app.insert_resource(MenuState {
+        t: 0.0,
+        auto_secs: std::env::var("T2T_MENU_SECS")
+            .ok()
+            .and_then(|v| v.parse::<f32>().ok()),
+        has_char: have_char,
+    });
+    // M7 audio (optional: absence only silences the game).
+    match prepare_audio(&bf_path) {
+        Some(ga) => {
+            app.insert_resource(ga);
+        }
+        None => eprintln!("[t2t] audio unavailable (Sound/ data not decoded) — continuing silent"),
+    }
+    // M7 boot intro (optional: absence boots to menu).
+    if let Some(st) = prepare_intro(start_playing) {
+        app.insert_resource(st);
+    }
+
     app.add_systems(Startup, setup);
+    app.add_systems(Update, intro_update.run_if(in_menu));
+    app.add_systems(Update, menu_update.run_if(in_menu));
     if have_char {
-        app.add_systems(Update, animate_char);
+        app.add_systems(Update, animate_char.run_if(in_playing));
     }
     app.run();
 }
