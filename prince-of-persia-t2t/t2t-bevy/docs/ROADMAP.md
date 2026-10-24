@@ -126,21 +126,32 @@ BIG reader + `bf_ls` + Bevy boot/index. Verified against the real
   (out/evidence/foley_fight6.log). Container format corrected the
   same day: child count @+0x1c, 16-byte {child, weight} entries —
   the +0x24 read shipped one silent build that played nothing.
-  Other combat foley (swing/hurt/death) still needs proven
-  semantics; the other Amir AI events in bank 003 are unwired.
+  Hurt foley wired 2026-10-24 (bank 003 event 0x17000f;
+  strikes play hurt, block variants reserved for a future
+  parry state). Swing/death still have no clean lead and
+  stay unwired; ground/wall (0x170010) is identified but
+  has no faithful trigger; the other Amir AI events in
+  bank 003 are unwired.
 - [x] Bink videos replaced by decoded playback (2026-10-24): boot
   intro sequence (UBISOFT/UBIMC/LOGORP/GO_GEN) via ffmpeg-extracted
   frame cache (out/video_cache), streamed into a fullscreen image
-  with per-clip audio; Cine/ story clips not yet triggered in-game.
+  with per-clip audio; Cine story clips (P3C_010..070, 640x448,
+  ~10 min total, 18,075 frames) play through a Phase::Cine player
+  that suspends gameplay and resumes it on end (verified headless:
+  mid-gameplay interruption, resume to gameplay, clip-over-menu
+  returning to menu, 0 panics). Staged via T2T_CINE/T2T_CINE_AT;
+  real story-beat triggers await M8 campaign work.
 - [x] World texture binding (2026-10-24): the merged world mesh is
   split by resolved texture key (Quai: 71 groups, 70 decoded;
   Menu3D: 53 groups, all decoded) with real DXT/PAL8 textures
   sampled via StandardMaterial (Repeat wrapping; cutout textures
   use alpha masking). Verified headless against the old flat-color
   build: dock props now show plank/striping detail, 0 panics,
-  foley still firing. PAL8 decodes as greyscale (no palette yet);
-  characters/enemies still flat-tinted — their material chain is
-  not resolved by the character loader.
+  foley still firing. PAL8 decoded with its sector palette from
+  2026-10-24 (prefix key at offset 52; Quai cutout groups 20→25
+  once PAL8 alpha went real); characters/enemies still
+  flat-tinted at this point — their material chain was not
+  resolved by the character loader yet.
 - [x] Character/enemy texture binding (2026-10-24): each skin's
   element textures resolve through its owning GAO's grm chain
   (M_PrinceBare, m_Kaileena, M_Sand_Guard, ...), stack into one
@@ -148,14 +159,112 @@ BIG reader + `bf_ls` + Bevy boot/index. Verified against the real
   256x256), and the corners' UVs remap into it — the one-mesh
   animation path is untouched. Verified headless: the flat beige
   fighters now show skin, cloth and trim detail, 0 panics,
-  foley still firing. PAL8 skins render greyscale (palette not
-  found yet — see NOTES); the Prince is full colour.
-- [ ] Menus/HUD per the original MENU data (beyond the shell).
+  foley still firing. PAL8 palettes cracked 2026-10-24 (prefix
+  key at offset 52 → same-sector 1024-byte record; Kaileena,
+  Sand Garde, Human Guard, Babylonian all resolve) — enemies
+  now render in full colour too, verified headless.
+- [x] Menus/HUD per the original MENU data (2026-10-24, verified
+  headless: main menu, options tree, pause overlay, bar HUD,
+  0 panics, lib tests 9/9): menu text comes from
+  POPData.bf's pop4pclocal.dat (INI sections, marker-located —
+  the container's name table is only partially reverse-engineered;
+  the .MGB/MAGMA layout format is NOT cracked, only its texture
+  and font references were read). Real navigable main menu
+  (Start New Game / Load Saved Game / Options / Credits / Change
+  Profile / Quit), full Options tree (Graphics / Sounds /
+  Controls / Game) with the original labels, pause menu on Esc
+  (Continue / Options / Quit to Main Menu, with session reset on
+  the next Start), quit-confirm dialog, and a segmented bar HUD
+  (health red, sand gold) replacing the HP/sand text. Only two
+  options toggles work so far (Music on/off, Interface on/off);
+  the other options rows are labels with no effect yet. Credits
+  video wired 2026-10-24 (CREDITS.BIK via the Cine player,
+  music stops/restarts around it). Game Over screen and the
+  Special Load dev map menu are NOT wired (checkpoint respawn
+  still handles death; MapNames
+  from the .dat is kept for M8). Staging: T2T_MENU_SCREEN=<name>
+  boots the menu on a screen, T2T_START_PAUSED=1 boots into
+  gameplay with the pause overlay open. Implementation note:
+  Bevy function systems cap at 16 params — the HUD lives in its
+  own hud_system, not animate_char.
 
 ## M8 — Campaign parity
 - All sectors wired in original order, scripted events/triggers,
   boss fights, difficulty tuning vs the original, full playthrough
   test start-to-finish.
+- STEP 1 DONE (2026-10-24, out/sector_census.log + out/campaign_sl.txt):
+  campaign order = the 66 MapNames SL entries from POPData.bf's
+  pop4pclocal.dat (SL_000 010_Deck ... SL_065 710_MaskSanctuaryV03,
+  the last marked "-alternate ending"). Full wow census: 579 wow
+  entries, 578 assembled (1 decompress failure:
+  500_ExitTo420_GFX_wow), 83 with placed >= 50 (main-sector
+  candidates incl. 100_Quai 158/56686, 200_ThroneRoom 118/57805,
+  630_Middle_Garden 159/45490, 810_TOWER_P03 252/61571),
+  149 with placed == 0 (actor/sound/manager sectors), 346 small
+  (GFX/prop/link sectors). Sectors are organized by AREA CODE
+  (100 Quai/Gate, 110 Entree, 200 ThroneRoom, 400 Start/Bridge,
+  410 RoofTops, 600 MarketPlace, 620/630 Gardens, 710 Fort,
+  800/810/820 Tower climbs, 900 SPRoom/SOT/WW).
+- STEP 1 FINDING (mapping gap): SL names do NOT appear in wow
+  entry names (all 66 substring searches empty), and the exe
+  contains no SL strings; TimeLine.bin is a placeholder (size +
+  0xffffffff + zeros, no sector data). SL steps therefore do NOT
+  map 1:1 to sectors by name — e.g. five ThroneRoom SL visits
+  (V01-V05) share one 200_ThroneRoom sector, so sectors are
+  REUSED across SL steps with different states/spawns. The
+  SL->sector map must come from sector exit/portal trigger
+  data or the save system's sector table — that is the next
+  M8 research step, not guessable from names.
+- STEP 2 DONE (2026-10-24, out/portal_graph.txt): the
+  sector-transition graph from in-sector GAOs (78 main
+  sectors scanned): ~100 PORTAL edges (Quai<->Depot,
+  Depot->InnerCourt, GateEntrance->SiegeTower,
+  110 Entree/Ruelle chain, 200 Corridor/Room/ThroneRoom
+  chain, Akduk Start->1st->2nd->3rd->4th->ExitTo640,
+  620 Courtyard->H01->InnerGarden, H02->SandGate->JctTo630,
+  700 Workshop->710, 740 Tomb<->800/TopWell, 900 SOT
+  02->03->04->WW_01, WW_02->WW_03, tower 800/810/820
+  chain, 400->410->420->500->510->520->600->610->620->630
+  ->640->700) plus name edges for link/exit sectors and
+  TEC_Sector identity codes (Se_<area>_<num>; a wow file
+  holds MULTIPLE sub-sectors, e.g. Plaza has 510_020/040/
+  050, RoofPart six). ~30 TEC_Checkpoint GAOs = the
+  respawn skeleton. 27 main sectors hold no portal/sector/
+  checkpoint GAOs in their own stream (transitions live in
+  the NEIGHBOUR's stream or GFX sectors; e.g.
+  Middle_Garden's sector object sits in Akduk_Start's
+  stream). NO Deck/Beach/Ship wow sectors exist — the
+  opening SL steps are cinematic, Quai is the first
+  playable sector. No saves exist to mine (profiles are
+  header-only), no level/chapter file exists in the BF
+  (full name list out/all_entry_names.txt), and the exe
+  carries no wow sector names — so the SL->sector binding
+  is NOT a static table anywhere found yet. Remaining
+  leads: portal GAO record payloads (beyond name/matrix)
+  may carry target keys or SL indices; sector behaviour
+  scripts may reference SL transitions.
+- STEP 3 DONE (2026-10-24, tool wow_rec): portal payload
+  archaeology — CLOSED NEGATIVE. Portal GAOs (Quai
+  PORTAL_Depot 0x3c03ae3e, Depot PORTAL_Quai 0x3c03ae42)
+  are a uniform 198-byte template: name + 68-byte matrix
+  + trigger volume (two float triples) + flags + a
+  trailing prev-key (own key - 1; the prev-key record is
+  itself a 4-byte record holding key - 1, a generic
+  record-chain pattern). NO target sector key, NO SL
+  index — the target resolves by NAME fragment only.
+  TEC_Sector and CheckPoint GAOs share the template (no
+  SL data), but checkpoint matrices ARE respawn positions
+  (usable for M8 later). Name overlap between SL and wow
+  layers is near-zero: only ThroneRoom (5 entries) and
+  Garden (16) match; AccessRoom/GuardPost/Sacrifice/
+  MechTower/Prison/Library/Forge/MaskSanctuary/Catacombs/
+  Deck/Beach have ZERO wow entries. The SL layer is a
+  separate localization naming; the SL->sector binding is
+  NOT recoverable from static data found so far. What
+  M8 can do WITHOUT it: the portal graph gives the first
+  verified playable chain Quai->Depot->InnerCourt, so the
+  next M8 step is making Depot loadable/playable with
+  portal travel — campaign progress that needs no SL map.
 
 ## Honest constraints
 - This is the largest kind of project in the folder — OpenJade took

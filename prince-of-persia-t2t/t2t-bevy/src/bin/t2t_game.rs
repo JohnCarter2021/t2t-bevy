@@ -15,7 +15,7 @@
 //!   defaults: pop3.bf, "Menu3D"
 
 use bevy::asset::RenderAssetUsages;
-use bevy::image::{ImageAddressMode, ImageSampler, ImageSamplerDescriptor};
+use bevy::image::{ImageAddressMode, ImageFilterMode, ImageSampler, ImageSamplerDescriptor};
 use bevy::render::alpha::AlphaMode;
 use bevy::prelude::*;
 use bevy::render::mesh::{Indices, PrimitiveTopology};
@@ -32,7 +32,7 @@ use t2t::geometry::parse_geometry;
 use t2t::jade_stream::decompress_entry;
 use t2t::material::texture_key_for;
 use t2t::skin::{posed_verts, ChannelMap, Character, Clip};
-use t2t::texture::{decode_texture, parse_texture};
+use t2t::texture::{decode_texture_pal, is_texture_entry, mip_chain, palette_key, parse_texture};
 use t2t::wow::walk_wow;
 
 #[derive(Resource)]
@@ -262,10 +262,12 @@ struct FollowCam;
 /// gameplay on Enter. Staging: T2T_START=play skips the
 /// menu entirely; T2T_MENU_SECS=<s> auto-starts after
 /// s seconds of menu time.
-#[derive(Resource, PartialEq, Eq, Clone, Copy)]
+#[derive(Resource, PartialEq, Eq, Clone, Copy, Debug)]
 enum Phase {
     Menu,
     Playing,
+    Paused,
+    Cine,
 }
 
 fn in_menu(phase: Res<Phase>) -> bool {
@@ -274,6 +276,349 @@ fn in_menu(phase: Res<Phase>) -> bool {
 
 fn in_playing(phase: Res<Phase>) -> bool {
     *phase == Phase::Playing
+}
+
+fn in_paused(phase: Res<Phase>) -> bool {
+    *phase == Phase::Paused
+}
+
+fn in_cine(phase: Res<Phase>) -> bool {
+    *phase == Phase::Cine
+}
+
+fn in_menu_or_paused(phase: Res<Phase>) -> bool {
+    *phase == Phase::Menu || *phase == Phase::Paused
+}
+
+/// Menu text from the original localization file
+/// (POPData.bf's pop4pclocal.dat, INI sections). Entries
+/// missing here fall back to the same English strings, so
+/// the game still menus when run against a bare pop3.bf.
+#[derive(Resource, Default)]
+struct MenuStrings {
+    map: std::collections::HashMap<String, std::collections::HashMap<String, String>>,
+}
+
+impl MenuStrings {
+    fn get(&self, section: &str, key: &str) -> Option<&str> {
+        self.map.get(section)?.get(key).map(|s| s.as_str())
+    }
+    fn txt(&self, section: &str, key: &str, fallback: &str) -> String {
+        self.get(section, key)
+            .unwrap_or(fallback)
+            .replace("||", "\n")
+    }
+}
+
+fn load_menu_strings(bf_path: &str) -> MenuStrings {
+    let mut out = MenuStrings::default();
+    let pop_path = std::path::Path::new(bf_path)
+        .parent()
+        .map(|p| p.join("POPData.bf"));
+    let data = match pop_path.as_ref().and_then(|p| std::fs::read(p).ok()) {
+        Some(d) => d,
+        None => return out,
+    };
+    // The .dat is the archive's last file and runs to EOF;
+    // locate it by its own first line (the container's
+    // name table is only reverse-engineered for two
+    // entries, so the marker search is the robust path).
+    let marker = b"; General information";
+    let start = match data
+        .windows(marker.len())
+        .position(|w| w == marker)
+    {
+        Some(i) => i,
+        None => return out,
+    };
+    let text = String::from_utf8_lossy(&data[start..]);
+    if !text.contains("[P_MainMenu]") {
+        return out;
+    }
+    let mut section = String::new();
+    for raw in text.lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with(';') {
+            continue;
+        }
+        if line.starts_with('[') && line.ends_with(']') {
+            section = line[1..line.len() - 1].to_string();
+            continue;
+        }
+        if let Some((k, v)) = line.split_once('=') {
+            out.map
+                .entry(section.clone())
+                .or_default()
+                .insert(k.trim().to_string(), v.trim().to_string());
+        }
+    }
+    out
+}
+
+/// Settings the options menus can actually change. Only
+/// two toggles are wired so far; every other options row
+/// is a faithful label with no effect yet.
+#[derive(Resource)]
+struct Settings {
+    music_on: bool,
+    interface_on: bool,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Settings {
+            music_on: true,
+            interface_on: true,
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum MenuScreen {
+    Main,
+    Options,
+    Graphics,
+    Sounds,
+    Controls,
+    GameOpts,
+    Profiles,
+    LoadGame,
+    Credits,
+    ConfirmQuit,
+    Pause,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MenuAction {
+    StartGame,
+    ToScreen(MenuScreen),
+    Back,
+    Resume,
+    QuitToMenu,
+    QuitApp,
+    ToggleMusic,
+    ToggleInterface,
+    PlayCredits,
+    Noop,
+}
+
+struct MenuItem {
+    label: String,
+    action: MenuAction,
+}
+
+/// The items of one menu screen, labels from the original
+/// localization with identical English fallbacks.
+fn menu_items(
+    screen: MenuScreen,
+    s: &MenuStrings,
+    settings: &Settings,
+) -> Vec<MenuItem> {
+    let t = |sec: &str, key: &str, fb: &str| s.txt(sec, key, fb);
+    let back = |s: &MenuStrings| MenuItem {
+        label: s.txt("P_Options", "Back", "Back"),
+        action: MenuAction::Back,
+    };
+    let noop = |label: String| MenuItem {
+        label,
+        action: MenuAction::Noop,
+    };
+    match screen {
+        MenuScreen::Main => vec![
+            MenuItem {
+                label: t("P_MainMenu", "NewGame", "Start New Game"),
+                action: MenuAction::StartGame,
+            },
+            MenuItem {
+                label: t("P_MainMenu", "LoadGame", "Load Saved Game"),
+                action: MenuAction::ToScreen(MenuScreen::LoadGame),
+            },
+            MenuItem {
+                label: t("P_MainMenu", "Options", "Options"),
+                action: MenuAction::ToScreen(MenuScreen::Options),
+            },
+            MenuItem {
+                label: t("P_MainMenu", "Credits", "Credits"),
+                action: MenuAction::PlayCredits,
+            },
+            MenuItem {
+                label: t("P_MainMenu", "Back", "Change Profile"),
+                action: MenuAction::ToScreen(MenuScreen::Profiles),
+            },
+            MenuItem {
+                label: t("P_MainMenu", "Quit", "Quit"),
+                action: MenuAction::ToScreen(MenuScreen::ConfirmQuit),
+            },
+        ],
+        MenuScreen::Options => vec![
+            MenuItem {
+                label: t("P_Options", "Video", "Graphics"),
+                action: MenuAction::ToScreen(MenuScreen::Graphics),
+            },
+            MenuItem {
+                label: t("P_Options", "Sounds", "Sounds"),
+                action: MenuAction::ToScreen(MenuScreen::Sounds),
+            },
+            MenuItem {
+                label: t("P_Options", "Controls", "Controls"),
+                action: MenuAction::ToScreen(MenuScreen::Controls),
+            },
+            MenuItem {
+                label: t("P_Options", "Game", "Game"),
+                action: MenuAction::ToScreen(MenuScreen::GameOpts),
+            },
+            back(s),
+        ],
+        MenuScreen::Graphics => vec![
+            noop(t("P_VideoMenu", "Effects", "Effects")),
+            noop(t("P_VideoMenu", "Water", "Water Effects")),
+            noop(t("P_VideoMenu", "Shadow", "Shadow Effects")),
+            noop(t("P_VideoMenu", "Filtering", "Filtering")),
+            noop(t("P_VideoMenu", "SpecialFX", "Special Effects")),
+            noop(t("P_VideoMenu", "Fog", "Fog")),
+            noop(t("P_VideoMenu", "VSync", "V-Sync.")),
+            noop(t("P_VideoMenu", "TextureQuality", "Texture Quality")),
+            noop(t("P_VideoMenu", "Resolution", "Resolution")),
+            noop(t("P_VideoMenu", "Gamma", "Gamma")),
+            noop(t("P_VideoMenu", "Brightness", "Brightness")),
+            noop(t("P_VideoMenu", "Contrast", "Contrast")),
+            noop(t("P_VideoMenu", "Advanced", "Advanced")),
+            noop(t("P_VideoMenu", "DefaultSettings", "Default Settings")),
+            noop(t("P_VideoMenu", "Save", "Save Settings")),
+            back(s),
+        ],
+        MenuScreen::Sounds => vec![
+            MenuItem {
+                label: format!(
+                    "Music: {}",
+                    if settings.music_on {
+                        s.txt("P_SoundsMenu", "MusicOn", "On")
+                    } else {
+                        s.txt("P_SoundsMenu", "MusicOff", "Off")
+                    }
+                ),
+                action: MenuAction::ToggleMusic,
+            },
+            noop(t("P_SoundsMenu", "MusicVolume", "Music Volume")),
+            noop(t("P_SoundsMenu", "VoicesVolume", "Voices Volume")),
+            noop(t("P_SoundsMenu", "EffectsVolume", "Effects Volume")),
+            noop(t(
+                "P_SoundsMenu",
+                "Virtualization",
+                "Audio Virtualization",
+            )),
+            noop(t(
+                "P_SoundsMenu",
+                "3DAudioHardwareAcceleration",
+                "3D Audio Hardware Acceleration",
+            )),
+            noop(t("P_SoundsMenu", "DefaultSettings", "Default Settings")),
+            noop(t("P_SoundsMenu", "Save", "Save Settings")),
+            back(s),
+        ],
+        MenuScreen::Controls => vec![
+            noop(t("P_ControlsMenu", "Keyboard", "Keyboard")),
+            noop(t("P_ControlsMenu", "Gamepad", "Gamepad")),
+            noop(t("P_ControlsMenu", "Camera", "Camera")),
+            noop(t("P_ControlsMenu", "MouseSpeed", "Mouse speed")),
+            noop(t("P_ControlsMenu", "FreeLook", "Camera Freelook")),
+            noop(t("P_ControlsMenu", "Navigation", "Camera Navigation")),
+            noop(t("P_ControlsMenu", "DefaultSettings", "Default Settings")),
+            noop(t("P_ControlsMenu", "Save", "Save Settings")),
+            back(s),
+        ],
+        MenuScreen::GameOpts => vec![
+            noop(t("P_GameOptions", "InsertFrequency", "Insert Frequency")),
+            noop(t("P_GameOptions", "Tutorials", "Tutorials")),
+            noop(t("P_GameOptions", "SetupMenu", "Setup Menu")),
+            noop(t("P_GameOptions", "Cheats", "Cheats")),
+            MenuItem {
+                label: format!(
+                    "{}: {}",
+                    t("P_GameOptions", "Interface", "Interface"),
+                    if settings.interface_on {
+                        s.txt("P_GameOptions", "InterfaceOn", "On")
+                    } else {
+                        s.txt("P_GameOptions", "InterfaceOff", "Off")
+                    }
+                ),
+                action: MenuAction::ToggleInterface,
+            },
+            noop(t("P_GameOptions", "WorkInProgress", "Work in Progress")),
+            noop(t("P_GameOptions", "DefaultSettings", "Default Settings")),
+            noop(t("P_GameOptions", "Save", "Save Settings")),
+            back(s),
+        ],
+        MenuScreen::Profiles => vec![
+            noop(t("P_ProfileMenu", "CreateNew", "New Profile")),
+            back(s),
+        ],
+        MenuScreen::LoadGame => vec![back(s)],
+        MenuScreen::Credits => vec![back(s)],
+        MenuScreen::ConfirmQuit => vec![
+            MenuItem {
+                label: t("ConfirmQuit", "Yes", "Yes"),
+                action: MenuAction::QuitApp,
+            },
+            MenuItem {
+                label: t("ConfirmQuit", "No", "No"),
+                action: MenuAction::Back,
+            },
+        ],
+        MenuScreen::Pause => vec![
+            MenuItem {
+                label: t("P_InGameMenu", "Continue", "Continue"),
+                action: MenuAction::Resume,
+            },
+            MenuItem {
+                label: t("P_InGameMenu", "Options", "Options"),
+                action: MenuAction::ToScreen(MenuScreen::Options),
+            },
+            MenuItem {
+                label: t("P_InGameMenu", "MainMenu", "Quit to Main Menu"),
+                action: MenuAction::QuitToMenu,
+            },
+            MenuItem {
+                label: t("P_InGameMenu", "Back", "Back"),
+                action: MenuAction::Resume,
+            },
+        ],
+    }
+}
+
+/// Screen title + info line shown above the list. The
+/// info lines for Load/Credits are this build's own state
+/// text, not original strings.
+fn menu_screen_text(screen: MenuScreen, s: &MenuStrings) -> (String, String) {
+    match screen {
+        MenuScreen::Main => (String::new(), String::new()),
+        MenuScreen::Options => (s.txt("P_Options", "Title", "Options"), String::new()),
+        MenuScreen::Graphics => (s.txt("P_VideoMenu", "Title", "Graphics"), String::new()),
+        MenuScreen::Sounds => (s.txt("P_SoundsMenu", "Title", "Sounds"), String::new()),
+        MenuScreen::Controls => (s.txt("P_ControlsMenu", "Title", "Controls"), String::new()),
+        MenuScreen::GameOpts => (
+            s.txt("P_GameOptions", "Title", "Game Options"),
+            String::new(),
+        ),
+        MenuScreen::Profiles => (
+            s.txt("P_ProfileMenu", "Title", "Choose Your Profile"),
+            String::new(),
+        ),
+        MenuScreen::LoadGame => (
+            s.txt("P_MainMenu", "LoadGame", "Load Saved Game"),
+            "No saved games yet".to_string(),
+        ),
+        MenuScreen::Credits => ("Credits".to_string(), "Credits video not wired yet".to_string()),
+        MenuScreen::ConfirmQuit => (
+            String::new(),
+            s.txt(
+                "ConfirmQuit",
+                "Text",
+                "Are you sure you want to quit\nPrince of Persia?",
+            ),
+        ),
+        MenuScreen::Pause => ("Paused".to_string(), String::new()),
+    }
 }
 
 /// Entities that belong to the menu presentation.
@@ -297,6 +642,55 @@ struct MenuState {
     t: f32,
     auto_secs: Option<f32>,
     has_char: bool,
+    screen: MenuScreen,
+    /// Screens to return to on Back (Main/Pause at root).
+    stack: Vec<MenuScreen>,
+    selected: usize,
+    /// Last rendered (screen, selected, music, interface)
+    /// for the menu list; the pause list tracks its own.
+    built: Option<(MenuScreen, usize, bool, bool)>,
+    pause_built: Option<(MenuScreen, usize, bool, bool)>,
+}
+
+/// The menu item list container (children rebuilt on
+/// screen/selection change).
+#[derive(Component)]
+struct MenuList;
+
+/// The info line above the menu list (screen titles,
+/// confirm questions, empty-state notes).
+#[derive(Component)]
+struct MenuInfo;
+
+/// The pause overlay root (visible only while Paused).
+#[derive(Component)]
+struct PauseUi;
+
+/// The info line in the pause overlay (sub-screen titles).
+#[derive(Component)]
+struct PauseInfo;
+
+/// The pause item list container.
+#[derive(Component)]
+struct PauseList;
+
+/// The in-game HUD bar root (health + sand segments).
+#[derive(Component)]
+struct HudRoot;
+
+/// One HUD bar segment. A single component (not separate
+/// Hp/Sand markers) because Bevy rejects two &mut queries
+/// over the same component in one system (B0001).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HudSegKind {
+    Hp,
+    Sand,
+}
+
+#[derive(Component)]
+struct HudSeg {
+    kind: HudSegKind,
+    idx: usize,
 }
 
 /// M7 audio: DARE sounds decoded at startup (prepare
@@ -317,6 +711,14 @@ struct GameAudio {
     /// 0x170024 — the blockSound every weapon object
     /// references (container of 3 waves).
     block_wavs: Vec<Vec<u8>>,
+    /// Flesh-hit sound: bank 003 event 0x17000f
+    /// (Impact_Hurt — identified by elimination
+    /// against the three Enemies_Weapon impact
+    /// functions plus its dull-thud waveform; the
+    /// third, 0x170010 GroundAndWall, has no
+    /// faithful trigger in this combat model and
+    /// is deliberately NOT loaded).
+    hurt_wav: Option<Vec<u8>>,
 }
 
 /// Bevy audio asset handles built from GameAudio in
@@ -326,7 +728,12 @@ struct AudioHandles {
     music: Handle<AudioSource>,
     ui_boot: Handle<AudioSource>,
     ui_confirm: Handle<AudioSource>,
+    /// Reserved for a future parry/block state: this
+    /// combat model has no blocking, so strikes play
+    /// the hurt sound, not the block variants.
+    #[allow(dead_code)]
     block: Vec<Handle<AudioSource>>,
+    hurt: Option<Handle<AudioSource>>,
 }
 
 /// The looping menu-music player entity (despawned
@@ -363,6 +770,152 @@ struct IntroState {
 /// The fullscreen intro video node.
 #[derive(Component)]
 struct IntroNode;
+
+/// In-game story-clip player: the seven Video/Cine/P3C_* clips
+/// (640x448 @ 29.97, same frame-streaming tech as the boot
+/// intro). Gameplay systems are gated on Phase::Playing, so
+/// entering Phase::Cine suspends the game; on end (or skip)
+/// the phase returns to `return_to` and gameplay resumes.
+/// Staging: T2T_CINE=<name|all> loads the clip(s) from the
+/// video cache (Cine/<name>/ frames + Cine/<name>.wav);
+/// without T2T_CINE_AT it plays at boot, with
+/// T2T_CINE_AT=<secs> it interrupts gameplay after that many
+/// seconds of Playing time. Real story-beat triggers belong
+/// to M8 campaign work — this is the player + trigger
+/// mechanism they will call. The CREDITS.BIK clip
+/// (800x600, loaded from cache Credits/ whenever present)
+/// rides the same player: the Credits menu item (or the
+/// T2T_PLAY_CREDITS staging env) requests it, the player
+/// plays just that clip (stop_after) and returns to Menu.
+/// The node image is resized on the first frame of a
+/// differently-sized clip, so 800x600 credits frames play
+/// through the 640x448-sized node.
+#[derive(Resource)]
+struct CineState {
+    active: bool,
+    pending: bool,
+    at_secs: Option<f32>,
+    elapsed: f32,
+    return_to: Phase,
+    clips: Vec<IntroClip>,
+    credits_idx: Option<usize>,
+    stop_after: Option<usize>,
+    clip: usize,
+    t: f32,
+    shown: usize,
+    started: bool,
+    img: Option<Handle<Image>>,
+    clip_audio: Vec<Option<Handle<AudioSource>>>,
+    audio_entity: Option<Entity>,
+}
+
+/// Marker resource: the Credits menu item (or the
+/// T2T_PLAY_CREDITS staging env) asks the Cine player to
+/// play the credits clip. cine_trigger consumes it.
+#[derive(Resource)]
+struct CreditsRequest;
+
+/// The fullscreen Cine video node.
+#[derive(Component)]
+struct CineNode;
+
+/// Load the staged Cine clip(s) from the video cache
+/// (T2T_VIDEO_CACHE, default out/video_cache), plus the
+/// credits clip from cache Credits/ whenever present.
+/// Returns None when neither exists — the game then runs
+/// with no Cine support. A missing staged clip is skipped
+/// with a warning (it must not kill the credits clip).
+fn prepare_cine() -> Option<CineState> {
+    let dir = std::env::var("T2T_VIDEO_CACHE").unwrap_or_else(|_| "out/video_cache".to_string());
+    let base = std::path::Path::new(&dir).join("Cine");
+    let mut clips = Vec::new();
+    if let Ok(want) = std::env::var("T2T_CINE") {
+        let names: Vec<String> = if want == "all" {
+            ["P3C_010", "P3C_020", "P3C_030", "P3C_040", "P3C_050", "P3C_060", "P3C_070"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect()
+        } else {
+            vec![want]
+        };
+        for name in &names {
+            let mut frames: Vec<(String, Vec<u8>)> = Vec::new();
+            for e in std::fs::read_dir(base.join(name)).into_iter().flatten().flatten() {
+                let p = e.path();
+                if p.extension().map_or(false, |x| x == "jpg") {
+                    if let Ok(b) = std::fs::read(&p) {
+                        frames.push((p.file_name().unwrap().to_string_lossy().into_owned(), b));
+                    }
+                }
+            }
+            frames.sort();
+            if frames.is_empty() {
+                eprintln!("[t2t] cine: no frames for {name} in cache — skipping");
+                continue;
+            }
+            clips.push(IntroClip {
+                name: name.clone(),
+                frames: frames.into_iter().map(|(_, b)| b).collect(),
+                audio_wav: std::fs::read(base.join(format!("{name}.wav"))).ok(),
+            });
+        }
+    }
+    // Credits clip: cache Credits/ frames + Credits.wav.
+    let mut credits_idx = None;
+    {
+        let cbase = std::path::Path::new(&dir).join("Credits");
+        let mut frames: Vec<(String, Vec<u8>)> = Vec::new();
+        for e in std::fs::read_dir(&cbase).into_iter().flatten().flatten() {
+            let p = e.path();
+            if p.extension().map_or(false, |x| x == "jpg") {
+                if let Ok(b) = std::fs::read(&p) {
+                    frames.push((p.file_name().unwrap().to_string_lossy().into_owned(), b));
+                }
+            }
+        }
+        frames.sort();
+        if !frames.is_empty() {
+            println!("[t2t] cine ready: credits clip, {} frames", frames.len());
+            credits_idx = Some(clips.len());
+            clips.push(IntroClip {
+                name: "CREDITS".to_string(),
+                frames: frames.into_iter().map(|(_, b)| b).collect(),
+                audio_wav: std::fs::read(cbase.join("Credits.wav")).ok(),
+            });
+        }
+    }
+    if clips.is_empty() {
+        return None;
+    }
+    println!(
+        "[t2t] cine ready: {} clips, {} frames",
+        clips.len(),
+        clips.iter().map(|c| c.frames.len()).sum::<usize>()
+    );
+    let at_secs = std::env::var("T2T_CINE_AT").ok().and_then(|v| v.parse::<f32>().ok());
+    // Boot-play only when staged clips exist; a
+    // credits-only state must NOT auto-play credits.
+    // (Credits is always appended last, so index 0
+    // with length 1 means credits-only.)
+    let staged_exist = !(credits_idx == Some(0) && clips.len() == 1);
+    Some(CineState {
+        active: false,
+        pending: at_secs.is_none() && staged_exist,
+        at_secs,
+        elapsed: 0.0,
+        return_to: Phase::Menu,
+        clips,
+        credits_idx,
+        stop_after: None,
+        clip: 0,
+        t: 0.0,
+        shown: usize::MAX,
+        started: false,
+        img: None,
+        clip_audio: Vec::new(),
+        audio_entity: None,
+    })
+}
 
 /// Load the extracted intro clips from the video
 /// cache (T2T_VIDEO_CACHE, default out/video_cache).
@@ -452,6 +1005,14 @@ fn prepare_audio(bf_path: &str) -> Option<GameAudio> {
         Some(out)
     })()
     .unwrap_or_default();
+    // Combat: bank 003's Impact_Hurt single wave.
+    let hurt_wav = (|| -> Option<Vec<u8>> {
+        let bank003 = read_entry(&mut big, "sound/003.sb0")?;
+        let b3 = parse_bank(&bank003).ok()?;
+        let s = b3.resolve_event(0x17000f).into_iter().next()?;
+        let pcm = decode_sound(&bank003, s).ok()?;
+        Some(wav_bytes(&pcm, s.channels, s.rate))
+    })();
     // Menu music: bank 000's stream track 0x700000.
     let bank000 = read_entry(&mut big, "sound/000.sb0")?;
     let b0 = parse_bank(&bank000).ok()?;
@@ -470,7 +1031,7 @@ fn prepare_audio(bf_path: &str) -> Option<GameAudio> {
         track.channels,
         track.rate
     );
-    Some(GameAudio { music_wav, ui_boot_wav, ui_confirm_wav, block_wavs })
+    Some(GameAudio { music_wav, ui_boot_wav, ui_confirm_wav, block_wavs, hurt_wav })
 }
 
 /// Jade (Z-up, ~100 units per metre) -> Bevy conversion shared
@@ -520,6 +1081,115 @@ fn char_corners(ch: &Character, clip: &Clip, map: &ChannelMap, frame: u32, spec_
         normals.extend([n, n, n]);
     }
     (positions, normals)
+}
+
+/// A sector-exit portal, from its PORTAL GAO: the name
+/// fragment after "PORTAL_" is the destination sector (the
+/// payload carries no target key — M8 step 3), and the
+/// matrix translation is the trigger centre in Jade units.
+/// Detection is a 12-unit sphere around that centre (the
+/// payload's local box is a few units across; the radius
+/// is a margin, not the box itself).
+struct Portal {
+    name: String,
+    target: String,
+    pos: [f32; 3],
+    fired: bool,
+}
+
+#[derive(Resource, Default)]
+struct Portals(Vec<Portal>);
+
+fn load_portals(bf_path: &str, wow_name: &str) -> Vec<Portal> {
+    let mut out = Vec::new();
+    let Ok(bf) = BigFile::open(bf_path) else {
+        return out;
+    };
+    let Some(entry) = bf.active_files().into_iter().find(|e| e.name.contains(wow_name)) else {
+        return out;
+    };
+    let Ok(data) = decompress_entry(bf.read_data(entry.index)) else {
+        return out;
+    };
+    for r in walk_wow(&data) {
+        if r.tag != ".gao" {
+            continue;
+        }
+        let range = r.data_range();
+        let Some(g) = parse_gao(&data[range]) else {
+            continue;
+        };
+        if !g.name.contains("PORTAL") {
+            continue;
+        }
+        let Some(m) = g.global_matrix else {
+            continue;
+        };
+        let target = g
+            .name
+            .split("PORTAL_")
+            .nth(1)
+            .unwrap_or("")
+            .trim_end_matches(".gao")
+            .split('@')
+            .next()
+            .unwrap_or("")
+            .to_string();
+        out.push(Portal {
+            name: g.name.clone(),
+            target,
+            pos: [m[12], m[13], m[14]],
+            fired: false,
+        });
+    }
+    for p in &out {
+        println!("[t2t] portal: {} -> {} at {:?}", p.name, p.target, p.pos);
+    }
+    out
+}
+
+/// M8: level-placed checkpoints can sit below the floor
+/// (Depot's checkpoint is 17.8 under its floor at 74.8) —
+/// respawning there falls straight through the world.
+/// Snap the respawn point UP to the floor when the point
+/// is not already grounded and a floor exists within 40
+/// above it; otherwise leave it untouched (a grounded
+/// checkpoint is unchanged, and a void respawn still
+/// falls as before).
+fn snap_respawn(soup: &TriangleSoup, p: [f32; 3]) -> [f32; 3] {
+    let grounded = soup
+        .ground_height(p[0], p[1], p[2], 0.0)
+        .map_or(false, |z| (z - p[2]).abs() < 2.0);
+    if grounded {
+        return p;
+    }
+    if let Some(z) = soup.ground_height(p[0], p[1], p[2] + 40.0, 0.0) {
+        if z > p[2] {
+            return [p[0], p[1], z + 2.0];
+        }
+    }
+    p
+}
+
+/// M8: log once when the player walks into a portal's
+/// trigger sphere. Travel itself (sector swap) is the
+/// next step; this verifies positions + detection first.
+fn portal_watch(mut portals: ResMut<Portals>, q: Query<&AnimatedChar>) {
+    let Ok(ac) = q.single() else {
+        return;
+    };
+    for p in portals.0.iter_mut().filter(|p| !p.fired) {
+        let dx = ac.ctl.pos[0] - p.pos[0];
+        let dy = ac.ctl.pos[1] - p.pos[1];
+        let dz = ac.ctl.pos[2] - p.pos[2];
+        if dx * dx + dy * dy + dz * dz < 12.0 * 12.0 {
+            p.fired = true;
+            println!(
+                "[t2t] portal: entered {} -> {} at {:?}",
+                p.name, p.target, ac.ctl.pos
+            );
+        }
+    }
 }
 
 fn prepare_world(bf_path: &str, wow_name: &str) -> Option<WorldMesh> {
@@ -602,6 +1272,16 @@ fn prepare_world(bf_path: &str, wow_name: &str) -> Option<WorldMesh> {
     // Decode each used texture once; a decode that does not
     // yield exactly w*h*4 bytes (or a missing record) leaves
     // the group to render in flat grey at spawn time.
+    // Palette records for this sector: 1024-byte non-texture
+    // records, last occurrence wins.
+    let mut pal_map: std::collections::HashMap<u32, std::ops::Range<usize>> =
+        std::collections::HashMap::new();
+    for r in walk_wow(&data) {
+        let sub = &data[r.data_range()];
+        if sub.len() == 1024 && !is_texture_entry(sub) {
+            pal_map.insert(r.key, r.data_range());
+        }
+    }
     let mut textures = Vec::new();
     for g in &groups {
         if let Some(key) = g.tex_key {
@@ -609,7 +1289,11 @@ fn prepare_world(bf_path: &str, wow_name: &str) -> Option<WorldMesh> {
                 continue;
             }
             if let Some((ti, range)) = world.textures.get(&key) {
-                let rgba = decode_texture(&data[range.clone()], ti);
+                let tex_data = &data[range.clone()];
+                let pal = palette_key(tex_data, ti)
+                    .and_then(|pk| pal_map.get(&pk))
+                    .map(|pr| &data[pr.clone()]);
+                let rgba = decode_texture_pal(tex_data, ti, pal);
                 if rgba.len() == ti.width as usize * ti.height as usize * 4
                     && ti.width > 0
                     && ti.height > 0
@@ -1055,6 +1739,16 @@ fn char_textures(
             tex_map.insert(r.key, (ti, r.data_range()));
         }
     }
+    // Palette records for this sector: 1024-byte non-texture
+    // records, last occurrence wins.
+    let mut pal_map: std::collections::HashMap<u32, std::ops::Range<usize>> =
+        std::collections::HashMap::new();
+    for r in &records {
+        let sub = &sector_data[r.data_range()];
+        if sub.len() == 1024 && !is_texture_entry(sub) {
+            pal_map.insert(r.key, r.data_range());
+        }
+    }
     let mut decoded = Vec::new();
     let mut seen = std::collections::HashSet::new();
     for tk in elem_tex.iter().flatten() {
@@ -1062,7 +1756,18 @@ fn char_textures(
             continue;
         }
         if let Some((ti, range)) = tex_map.get(tk) {
-            let rgba = decode_texture(&sector_data[range.clone()], ti);
+            let tex_data = &sector_data[range.clone()];
+            let pal = palette_key(tex_data, ti)
+                .and_then(|pk| pal_map.get(&pk))
+                .map(|pr| &sector_data[pr.clone()]);
+            let mut rgba = decode_texture_pal(tex_data, ti, pal);
+            // Characters are solid in-game: force opaque so a
+            // palette whose 4th byte is not alpha (Sand Garde /
+            // Human Guard) cannot turn the fighter ghostly, and
+            // so the atlas stays Opaque as before.
+            for px in rgba.chunks_exact_mut(4) {
+                px[3] = 255;
+            }
             if rgba.len() == ti.width as usize * ti.height as usize * 4
                 && ti.width > 0
                 && ti.height > 0
@@ -1076,8 +1781,8 @@ fn char_textures(
 
 /// Stack decoded textures into one atlas (single column, key
 /// order). Returns the atlas plus each key's rect (x, y, w, h).
-/// PAL8 textures arrive as greyscale (no palette found yet) —
-/// their detail is real, their colour is not.
+/// PAL8 textures arrive decoded with their sector palette where
+/// one resolves, greyscale where none does.
 fn build_char_atlas(
     decoded: &[(u32, u32, u32, Vec<u8>)],
 ) -> Option<(CharAtlas, std::collections::HashMap<u32, (u32, u32, u32, u32)>)> {
@@ -1435,7 +2140,6 @@ fn animate_char(
     mut meshes: ResMut<Assets<Mesh>>,
     mut q: Query<&mut AnimatedChar>,
     mut q_enemy: Query<&mut EnemyChar>,
-    mut q_hud: Query<&mut Text, With<HudText>>,
     mut cam: Query<&mut Transform, With<FollowCam>>,
     audio_handles: Option<Res<AudioHandles>>,
 ) {
@@ -1567,7 +2271,7 @@ fn animate_char(
             ac.fighter.take_hit(999);
         }
         if spec.enemies.is_empty() && ac.fighter.state == FighterState::Dead {
-            let rp = ac.checkpoint.respawn_point(spec.spawn);
+            let rp = snap_respawn(&spec.soup, ac.checkpoint.respawn_point(spec.spawn));
             println!("[t2t] respawning at {rp:?}");
             ac.ctl = Controller::new(rp);
             ac.ctl.yaw = ac.checkpoint.yaw;
@@ -1672,7 +2376,6 @@ fn animate_char(
         // direction) plays the blockSound (bank 003
         // event 0x170024, a random variant).
         let mut landed = false;
-        let mut hud = String::new();
         // Enemies live on world time: slowed while the
         // Prince's slow motion runs.
         let edt = dt
@@ -1766,24 +2469,22 @@ fn animate_char(
                 mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, positions);
                 mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, normals);
             }
-            hud.push_str(&format!(
-                "    {} HP {} / {}",
-                e_spec.name, ec.fighter.hp, ec.fighter.max_hp
-            ));
         }
         if landed {
+            // Strikes in this model always land on flesh
+            // (no parry state), so they play the hurt
+            // sound; the block variants stay reserved.
             if let Some(h) = &audio_handles {
-                if !h.block.is_empty() {
-                    let pick = (time.elapsed_secs() * 7.31) as usize % h.block.len();
-                    commands.spawn((AudioPlayer(h.block[pick].clone()), PlaybackSettings::DESPAWN));
-                    println!("[t2t] audio: sword impact (event 0x170024 variant {})", pick + 1);
+                if let Some(hurt) = &h.hurt {
+                    commands.spawn((AudioPlayer(hurt.clone()), PlaybackSettings::DESPAWN));
+                    println!("[t2t] audio: sword hurt (event 0x17000f)");
                 }
             }
         }
         // Player death -> reset the whole fight.
         if let Ok(mut ac) = q.single_mut() {
             if ac.fighter.state == FighterState::Dead {
-                let rp = ac.checkpoint.respawn_point(spec.spawn);
+                let rp = snap_respawn(&spec.soup, ac.checkpoint.respawn_point(spec.spawn));
                 if ac.checkpoint.point.is_some() {
                     println!("[t2t] the Prince falls - respawning at checkpoint {rp:?}");
                 } else {
@@ -1801,24 +2502,95 @@ fn animate_char(
                     ec.sand_paid = false;
                 }
             }
-            if let Ok(mut text) = q_hud.single_mut() {
-                let slow = if ac.slowmo_t > 0.0 {
-                    format!("    [SLOW-MO {:.1}s]", ac.slowmo_t)
-                } else {
-                    String::new()
-                };
-                **text = format!(
-                    "Prince HP {} / {}    Sand {} / {}{}{}",
-                    ac.fighter.hp, ac.fighter.max_hp, ac.sand.sand, ac.sand.max, hud, slow
-                );
-            }
+
         }
+    }
+}
+
+/// Segmented HUD bars (health red, sand gold) + enemy HP
+/// text + slow-mo readout. Split out of animate_char:
+/// Bevy function systems cap at 16 params and that one
+/// was already at 12. Prince HP/sand live in the bars;
+/// the text keeps enemy HP + slow-mo.
+fn hud_system(
+    settings: Res<Settings>,
+    spec: Option<Res<CharSpec>>,
+    players: Query<&AnimatedChar>,
+    foes: Query<&EnemyChar>,
+    mut q_segs: Query<(&HudSeg, &mut BackgroundColor)>,
+    mut q_hudvis: Query<&mut Visibility, Or<(With<HudRoot>, With<HudText>)>>,
+    mut q_hud: Query<&mut Text, With<HudText>>,
+) {
+    let (Ok(ac), Some(spec)) = (players.single(), spec.as_deref()) else {
+        return;
+    };
+    let hud_vis = if settings.interface_on {
+        Visibility::Inherited
+    } else {
+        Visibility::Hidden
+    };
+    for mut v in &mut q_hudvis {
+        *v = hud_vis;
+    }
+    for (seg, mut bg) in &mut q_segs {
+        let filled = match seg.kind {
+            HudSegKind::Hp => (seg.idx as i32) < ac.fighter.hp,
+            HudSegKind::Sand => (seg.idx as u32) < ac.sand.sand,
+        };
+        let color = if filled {
+            match seg.kind {
+                HudSegKind::Hp => Color::srgb(0.85, 0.15, 0.15),
+                HudSegKind::Sand => Color::srgb(0.9, 0.75, 0.3),
+            }
+        } else {
+            Color::srgb(0.2, 0.2, 0.22)
+        };
+        *bg = BackgroundColor(color);
+    }
+    if let Ok(mut text) = q_hud.single_mut() {
+        let mut hud = String::new();
+        for ec in &foes {
+            let e_spec = &spec.enemies[ec.idx];
+            hud.push_str(&format!(
+                "    {} HP {} / {}",
+                e_spec.name, ec.fighter.hp, ec.fighter.max_hp
+            ));
+        }
+        let slow = if ac.slowmo_t > 0.0 {
+            format!("    [SLOW-MO {:.1}s]", ac.slowmo_t)
+        } else {
+            String::new()
+        };
+        **text = format!("{}{}", hud, slow);
     }
 }
 
 /// Build one Bevy mesh + material per world texture group: real
 /// sampled textures replace the old per-element average colours.
 /// Groups without a decoded texture fall back to flat grey.
+/// A decoded RGBA texture as a mipmapped Bevy image: the CPU
+/// box-filter chain from texture::mip_chain, uploaded as one
+/// tightly-packed buffer (wgpu's create_texture_with_data
+/// splits it per level). Image::new can't be used here —
+/// it asserts data.len() == level-0 size — so the image is
+/// built uninit and the descriptor count set by hand.
+fn mipmapped_image(width: u32, height: u32, rgba: Vec<u8>) -> Image {
+    let (data, levels) = mip_chain(&rgba, width, height);
+    let mut img = Image::new_uninit(
+        Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+        TextureDimension::D2,
+        TextureFormat::Rgba8UnormSrgb,
+        RenderAssetUsages::default(),
+    );
+    img.texture_descriptor.mip_level_count = levels;
+    img.data = Some(data);
+    img
+}
+
 fn world_group_assets(
     w: &WorldMesh,
     meshes: &mut Assets<Mesh>,
@@ -1828,21 +2600,15 @@ fn world_group_assets(
     let mut tex_handles: std::collections::HashMap<u32, Handle<Image>> =
         std::collections::HashMap::new();
     for t in &w.textures {
-        let mut img = Image::new(
-            Extent3d {
-                width: t.width,
-                height: t.height,
-                depth_or_array_layers: 1,
-            },
-            TextureDimension::D2,
-            t.rgba.clone(),
-            TextureFormat::Rgba8UnormSrgb,
-            RenderAssetUsages::default(),
-        );
+        let mut img = mipmapped_image(t.width, t.height, t.rgba.clone());
         // Jade UVs tile past [0, 1] on walls and floors.
+        // Linear mipmap filtering: without it the GPU
+        // samples level 0 at every distance and distant
+        // walls shimmer.
         img.sampler = ImageSampler::Descriptor(ImageSamplerDescriptor {
             address_mode_u: ImageAddressMode::Repeat,
             address_mode_v: ImageAddressMode::Repeat,
+            mipmap_filter: ImageFilterMode::Linear,
             ..Default::default()
         });
         tex_handles.insert(t.key, images.add(img));
@@ -1873,11 +2639,19 @@ fn world_group_assets(
                         } else {
                             AlphaMode::Opaque
                         },
+                        // M8: level shells are single-sided and
+                        // face outward — from inside a room
+                        // (Depot) the walls are backfaces and
+                        // vanish under default culling. Render
+                        // both sides; outdoors this changes
+                        // nothing (front faces still win depth).
+                        cull_mode: None,
                         ..default()
                     }
                 }
                 None => StandardMaterial {
                     base_color: Color::srgb(0.6, 0.58, 0.54),
+                    cull_mode: None,
                     ..default()
                 },
             };
@@ -1886,25 +2660,20 @@ fn world_group_assets(
         .collect()
 }
 
-/// Material for a character atlas. The image keeps Bevy's
-/// default sampler (ClampToEdge): an atlas must not repeat,
-/// or faces would sample neighbouring stacked textures.
+/// Material for a character atlas. The sampler stays
+/// ClampToEdge (an atlas must not repeat, or faces would
+/// sample neighbouring stacked textures) with Linear
+/// mipmap filtering added.
 fn char_atlas_material(
     at: &CharAtlas,
     materials: &mut Assets<StandardMaterial>,
     images: &mut Assets<Image>,
 ) -> Handle<StandardMaterial> {
-    let img = Image::new(
-        Extent3d {
-            width: at.width,
-            height: at.height,
-            depth_or_array_layers: 1,
-        },
-        TextureDimension::D2,
-        at.rgba.clone(),
-        TextureFormat::Rgba8UnormSrgb,
-        RenderAssetUsages::default(),
-    );
+    let mut img = mipmapped_image(at.width, at.height, at.rgba.clone());
+    img.sampler = ImageSampler::Descriptor(ImageSamplerDescriptor {
+        mipmap_filter: ImageFilterMode::Linear,
+        ..Default::default()
+    });
     materials.add(StandardMaterial {
         base_color: Color::WHITE,
         base_color_texture: Some(images.add(img)),
@@ -1929,7 +2698,9 @@ fn setup(
     audio: Option<Res<GameAudio>>,
     mut audio_assets: ResMut<Assets<AudioSource>>,
     intro: Option<ResMut<IntroState>>,
+    cine: Option<ResMut<CineState>>,
     mut images: ResMut<Assets<Image>>,
+    settings: Res<Settings>,
 ) {
     // M7: in menu phase the gameplay scene starts hidden
     // behind the Menu3D backdrop; the transition flips
@@ -2109,7 +2880,7 @@ fn setup(
                 TextColor(Color::WHITE),
                 Node {
                     position_type: PositionType::Absolute,
-                    top: Val::Px(14.0),
+                    top: Val::Px(52.0),
                     left: Val::Px(14.0),
                     ..default()
                 },
@@ -2118,6 +2889,67 @@ fn setup(
                 game_vis,
             ));
         }
+        // Segmented HUD bars: health (Prince max HP) and
+        // sand tank, filled per frame by animate_char.
+        let hp_n = player_fighter().max_hp as usize;
+        commands
+            .spawn((
+                Node {
+                    position_type: PositionType::Absolute,
+                    top: Val::Px(14.0),
+                    left: Val::Px(14.0),
+                    flex_direction: FlexDirection::Column,
+                    row_gap: Val::Px(6.0),
+                    ..default()
+                },
+                HudRoot,
+                GameEntity,
+                game_vis,
+            ))
+            .with_children(|p| {
+                p.spawn(Node {
+                    flex_direction: FlexDirection::Row,
+                    column_gap: Val::Px(3.0),
+                    ..default()
+                })
+                .with_children(|r| {
+                    for i in 0..hp_n {
+                        r.spawn((
+                            Node {
+                                width: Val::Px(26.0),
+                                height: Val::Px(14.0),
+                                ..default()
+                            },
+                            BackgroundColor(Color::srgb(0.2, 0.2, 0.22)),
+                            HudSeg {
+                                kind: HudSegKind::Hp,
+                                idx: i,
+                            },
+                        ));
+                    }
+                });
+                p.spawn(Node {
+                    flex_direction: FlexDirection::Row,
+                    column_gap: Val::Px(3.0),
+                    ..default()
+                })
+                .with_children(|r| {
+                    for i in 0..SAND_MAX as usize {
+                        r.spawn((
+                            Node {
+                                width: Val::Px(26.0),
+                                height: Val::Px(14.0),
+                                ..default()
+                            },
+                            BackgroundColor(Color::srgb(0.2, 0.2, 0.22)),
+                            HudSeg {
+                                kind: HudSegKind::Sand,
+                                idx: i,
+                            },
+                        ));
+                    }
+                });
+            });
     }
     // M7: the menu backdrop (the game's real Menu3D
     // scene) + title UI.
@@ -2166,15 +2998,74 @@ fn setup(
                 TextFont { font_size: 27.0, ..default() },
                 TextColor(Color::srgb(0.75, 0.68, 0.55)),
             ));
+            // Screen title / info line + the item list,
+            // both filled by menu_list_system.
             p.spawn((
-                Text::new("Press ENTER to start"),
-                TextFont { font_size: 22.0, ..default() },
-                TextColor(Color::WHITE),
+                Text::new(""),
+                TextFont { font_size: 20.0, ..default() },
+                TextColor(Color::srgb(0.85, 0.8, 0.7)),
+                MenuInfo,
+            ));
+            p.spawn((
+                Node {
+                    flex_direction: FlexDirection::Column,
+                    align_items: AlignItems::Center,
+                    row_gap: Val::Px(8.0),
+                    ..default()
+                },
+                MenuList,
+            ));
+            p.spawn((
+                Text::new("Arrows/W/S move \u{00b7} Enter select \u{00b7} Esc back"),
+                TextFont { font_size: 15.0, ..default() },
+                TextColor(Color::srgb(0.6, 0.6, 0.62)),
             ));
             p.spawn((
                 Text::new("WASD move \u{00b7} Space jump \u{00b7} F attack \u{00b7} R sand slow-motion"),
                 TextFont { font_size: 15.0, ..default() },
                 TextColor(Color::srgb(0.6, 0.6, 0.62)),
+            ));
+        });
+    // Pause overlay: dark panel over the frozen game,
+    // filled by menu_list_system while Paused.
+    commands
+        .spawn((
+            Node {
+                position_type: PositionType::Absolute,
+                left: Val::Percent(0.0),
+                top: Val::Percent(0.0),
+                width: Val::Percent(100.0),
+                height: Val::Percent(100.0),
+                flex_direction: FlexDirection::Column,
+                align_items: AlignItems::Center,
+                justify_content: JustifyContent::Center,
+                row_gap: Val::Px(10.0),
+                ..default()
+            },
+            BackgroundColor(Color::srgba(0.0, 0.0, 0.0, 0.55)),
+            PauseUi,
+            Visibility::Hidden,
+        ))
+        .with_children(|p| {
+            p.spawn((
+                Text::new("Paused"),
+                TextFont { font_size: 40.0, ..default() },
+                TextColor(Color::srgb(0.92, 0.85, 0.68)),
+            ));
+            p.spawn((
+                Text::new(""),
+                TextFont { font_size: 20.0, ..default() },
+                TextColor(Color::srgb(0.85, 0.8, 0.7)),
+                PauseInfo,
+            ));
+            p.spawn((
+                Node {
+                    flex_direction: FlexDirection::Column,
+                    align_items: AlignItems::Center,
+                    row_gap: Val::Px(8.0),
+                    ..default()
+                },
+                PauseList,
             ));
         });
     commands.spawn((
@@ -2211,16 +3102,22 @@ fn setup(
                 .iter()
                 .map(|w| audio_assets.add(AudioSource { bytes: w.clone().into() }))
                 .collect(),
+            hurt: a
+                .hurt_wav
+                .as_ref()
+                .map(|w| audio_assets.add(AudioSource { bytes: w.clone().into() })),
         };
         if in_menu_start && !intro_active {
-            commands.spawn((
-                AudioPlayer(handles.music.clone()),
-                PlaybackSettings {
-                    volume: bevy::audio::Volume::Decibels(-6.0),
-                    ..PlaybackSettings::LOOP
-                },
-                MusicPlayer,
-            ));
+            if settings.music_on {
+                commands.spawn((
+                    AudioPlayer(handles.music.clone()),
+                    PlaybackSettings {
+                        volume: bevy::audio::Volume::Decibels(-6.0),
+                        ..PlaybackSettings::LOOP
+                    },
+                    MusicPlayer,
+                ));
+            }
             commands.spawn((AudioPlayer(handles.ui_boot.clone()), PlaybackSettings::ONCE));
             println!("[t2t] audio: menu music + boot sound playing (event 0x190002)");
         }
@@ -2265,6 +3162,46 @@ fn setup(
             println!("[t2t] intro: playing UBISOFT (Enter skips)");
         }
     }
+    // Cine: fullscreen video node (hidden until triggered)
+    // + clip audio. Deliberately NOT a MenuEntity: menu
+    // transitions must never show or hide this node.
+    if let Some(mut st) = cine {
+        if !st.clips.is_empty() {
+            let img = images.add(Image::new_fill(
+                bevy::render::render_resource::Extent3d {
+                    width: 640,
+                    height: 448,
+                    depth_or_array_layers: 1,
+                },
+                bevy::render::render_resource::TextureDimension::D2,
+                &[0, 0, 0, 255],
+                bevy::render::render_resource::TextureFormat::Rgba8UnormSrgb,
+                RenderAssetUsages::default(),
+            ));
+            let mut ch = Vec::new();
+            for c in &st.clips {
+                ch.push(
+                    c.audio_wav
+                        .as_ref()
+                        .map(|w| audio_assets.add(AudioSource { bytes: w.clone().into() })),
+                );
+            }
+            st.clip_audio = ch;
+            st.img = Some(img.clone());
+            commands.spawn((
+                Node {
+                    width: Val::Percent(100.0),
+                    height: Val::Percent(100.0),
+                    position_type: PositionType::Absolute,
+                    ..default()
+                },
+                ImageNode::new(img),
+                CineNode,
+                GlobalZIndex(11),
+                Visibility::Hidden,
+            ));
+        }
+    }
 }
 
 /// Boot intro playback: advance the current clip at
@@ -2283,6 +3220,7 @@ fn intro_update(
     mut images: ResMut<Assets<Image>>,
     audio_handles: Option<Res<AudioHandles>>,
     mut node_q: Query<&mut Visibility, With<IntroNode>>,
+    music_q: Query<Entity, With<MusicPlayer>>,
 ) {
     let Some(mut intro) = intro else {
         return;
@@ -2307,14 +3245,19 @@ fn intro_update(
                 *v = Visibility::Hidden;
             }
             if let Some(h) = audio_handles {
-                commands.spawn((
-                    AudioPlayer(h.music.clone()),
-                    PlaybackSettings {
-                        volume: bevy::audio::Volume::Decibels(-6.0),
-                        ..PlaybackSettings::LOOP
-                    },
-                    MusicPlayer,
-                ));
+                // A video over the menu may already have
+                // restarted the music on its own return;
+                // never run two menu-music players.
+                if music_q.is_empty() {
+                    commands.spawn((
+                        AudioPlayer(h.music.clone()),
+                        PlaybackSettings {
+                            volume: bevy::audio::Volume::Decibels(-6.0),
+                            ..PlaybackSettings::LOOP
+                        },
+                        MusicPlayer,
+                    ));
+                }
                 commands.spawn((AudioPlayer(h.ui_boot.clone()), PlaybackSettings::ONCE));
                 println!("[t2t] intro done -> menu (music + boot sound)");
             }
@@ -2346,22 +3289,204 @@ fn intro_update(
     }
 }
 
+/// Cine trigger: boot activation (no T2T_CINE_AT) fires on
+/// the first frame, returning to the boot phase; a staged
+/// T2T_CINE_AT fires once after that many seconds of
+/// Playing time, returning to Playing. Activation shows
+/// the Cine node and freezes gameplay (all gameplay
+/// systems are gated on Phase::Playing).
+fn cine_trigger(
+    mut commands: Commands,
+    cine: Option<ResMut<CineState>>,
+    mut phase: ResMut<Phase>,
+    time: Res<Time>,
+    mut node_q: Query<&mut Visibility, With<CineNode>>,
+    mut music_q: Query<Entity, With<MusicPlayer>>,
+    credits_req: Option<Res<CreditsRequest>>,
+) {
+    let Some(mut cine) = cine else {
+        return;
+    };
+    if cine.active {
+        return;
+    }
+    // Credits request wins over the staged triggers and
+    // plays just the credits clip (stop_after).
+    let mut fire_clip: Option<usize> = None;
+    let mut fire_stop: Option<usize> = None;
+    if credits_req.is_some() {
+        commands.remove_resource::<CreditsRequest>();
+        if let Some(idx) = cine.credits_idx {
+            fire_clip = Some(idx);
+            fire_stop = Some(idx + 1);
+        } else {
+            println!("[t2t] cine: credits requested but no credits clip in cache");
+            return;
+        }
+    } else if cine.pending {
+        cine.pending = false;
+        fire_clip = Some(0);
+    } else if *phase == Phase::Playing {
+        if let Some(at) = cine.at_secs {
+            cine.elapsed += time.delta_secs();
+            if cine.elapsed >= at {
+                cine.at_secs = None;
+                fire_clip = Some(0);
+            }
+        }
+    }
+    if let Some(c) = fire_clip {
+        cine.return_to = *phase;
+        // WITHOUT this line the phase never becomes Cine, so
+        // cine_update (run_if in_cine) never runs: the node
+        // sits black over a still-running game forever.
+        *phase = Phase::Cine;
+        cine.active = true;
+        cine.clip = c;
+        cine.stop_after = fire_stop;
+        cine.t = 0.0;
+        cine.shown = usize::MAX;
+        cine.started = false;
+        // A video replaces the menu music; cine_update
+        // restarts it on return to Menu.
+        if !music_q.is_empty() {
+            for e in music_q.iter() {
+                commands.entity(e).despawn();
+            }
+            println!("[t2t] audio: music stopped for video");
+        }
+        for mut v in &mut node_q {
+            *v = Visibility::Visible;
+        }
+        println!(
+            "[t2t] cine: playing {} (return to {:?})",
+            cine.clips[cine.clip].name, cine.return_to
+        );
+    }
+}
+
+/// Cine playback: same frame-streaming as the intro, at
+/// 29.97 fps, into the Cine node's image. Enter / Space /
+/// click skips the current clip. On end, the node hides,
+/// the clip audio stops, and the phase returns to
+/// `return_to` (gameplay resumes where it froze).
+#[allow(clippy::too_many_arguments)]
+fn cine_update(
+    mut commands: Commands,
+    time: Res<Time>,
+    keys: Res<ButtonInput<KeyCode>>,
+    mouse: Res<ButtonInput<MouseButton>>,
+    cine: Option<ResMut<CineState>>,
+    mut images: ResMut<Assets<Image>>,
+    mut phase: ResMut<Phase>,
+    mut node_q: Query<(&mut Visibility, &mut ImageNode), With<CineNode>>,
+    settings: Res<Settings>,
+    audio_handles: Option<Res<AudioHandles>>,
+    music_q: Query<Entity, With<MusicPlayer>>,
+) {
+    let Some(mut cine) = cine else {
+        return;
+    };
+    if !cine.active {
+        return;
+    }
+    cine.t += time.delta_secs();
+    let skip = keys.just_pressed(KeyCode::Enter)
+        || keys.just_pressed(KeyCode::Space)
+        || mouse.just_pressed(MouseButton::Left);
+    let clip_len = cine.clips[cine.clip].frames.len();
+    let frame = (cine.t * 29.97) as usize;
+    if skip || frame >= clip_len {
+        if let Some(e) = cine.audio_entity.take() {
+            commands.entity(e).despawn();
+        }
+        cine.clip += 1;
+        cine.t = 0.0;
+        cine.shown = usize::MAX;
+        cine.started = false;
+        if cine.clip >= cine.clips.len() || Some(cine.clip) == cine.stop_after {
+            cine.active = false;
+            cine.stop_after = None;
+            for (mut v, _) in &mut node_q {
+                *v = Visibility::Hidden;
+            }
+            let back = cine.return_to;
+            *phase = back;
+            if back == Phase::Menu && settings.music_on && music_q.is_empty() {
+                if let Some(h) = audio_handles {
+                    commands.spawn((
+                        AudioPlayer(h.music.clone()),
+                        PlaybackSettings {
+                            volume: bevy::audio::Volume::Decibels(-6.0),
+                            ..PlaybackSettings::LOOP
+                        },
+                        MusicPlayer,
+                    ));
+                    println!("[t2t] audio: menu music restarted after video");
+                }
+            }
+            println!("[t2t] cine done -> {:?}", back);
+            return;
+        }
+        println!("[t2t] cine: {}", cine.clips[cine.clip].name);
+        return;
+    }
+    if !cine.started {
+        cine.started = true;
+        if let Some(Some(h)) = cine.clip_audio.get(cine.clip) {
+            let h = h.clone();
+            let e = commands.spawn((AudioPlayer(h), PlaybackSettings::DESPAWN)).id();
+            cine.audio_entity = Some(e);
+        }
+    }
+    if frame != cine.shown {
+        cine.shown = frame;
+        let jpeg = cine.clips[cine.clip].frames.get(frame).cloned();
+        if let (Some(jpeg), Some(handle)) = (jpeg, cine.img.clone()) {
+            if let Ok(dynimg) = image::load_from_memory(&jpeg) {
+                let rgba = dynimg.to_rgba8();
+                let (w, h) = (rgba.width(), rgba.height());
+                let cur = images
+                    .get(&handle)
+                    .map(|im| (im.texture_descriptor.size.width, im.texture_descriptor.size.height));
+                if cur == Some((w, h)) {
+                    if let Some(img) = images.get_mut(&handle) {
+                        img.data = Some(rgba.into_raw());
+                    }
+                } else {
+                    // First frame of a differently-sized clip
+                    // (credits is 800x600, Cine clips are
+                    // 640x448): swap the node image in.
+                    let new_img = images.add(Image::new(
+                        bevy::render::render_resource::Extent3d {
+                            width: w,
+                            height: h,
+                            depth_or_array_layers: 1,
+                        },
+                        bevy::render::render_resource::TextureDimension::D2,
+                        rgba.into_raw(),
+                        bevy::render::render_resource::TextureFormat::Rgba8UnormSrgb,
+                        RenderAssetUsages::default(),
+                    ));
+                    for (_, mut node_img) in &mut node_q {
+                        node_img.image = new_img.clone();
+                    }
+                    cine.img = Some(new_img);
+                }
+            }
+        }
+    }
+}
+
 /// Menu phase: slowly orbit the Menu3D backdrop and
 /// watch for the start signal (Enter, or the staged
 /// T2T_MENU_SECS timer). On start, hide the menu
 /// presentation, reveal the gameplay scene, and hand
 /// the camera to animate_char.
 fn menu_update(
-    mut commands: Commands,
     time: Res<Time>,
-    keys: Res<ButtonInput<KeyCode>>,
-    mut phase: ResMut<Phase>,
     mut state: ResMut<MenuState>,
     mut cam: Query<&mut Transform, With<FollowCam>>,
-    mut menu_q: Query<&mut Visibility, (With<MenuEntity>, Without<GameEntity>)>,
-    mut game_q: Query<&mut Visibility, (With<GameEntity>, Without<MenuEntity>)>,
-    audio_handles: Option<Res<AudioHandles>>,
-    music_q: Query<Entity, With<MusicPlayer>>,
 ) {
     state.t += time.delta_secs();
     // Menu3D is a skybox ring (~40 across) around a
@@ -2380,29 +3505,471 @@ fn menu_update(
         )
         .looking_at(Vec3::new(-0.5, -3.0, 1.0), Vec3::Y);
     }
-    let auto = state.auto_secs.map_or(false, |s| state.t >= s);
-    if keys.just_pressed(KeyCode::Enter) || auto {
-        if !state.has_char {
-            println!("[t2t] menu: no playable sector loaded (start ignored)");
+}
+
+/// Reset a finished (or fresh) session to its spawn state:
+/// the player back at the spec spawn with full HP and sand,
+/// every enemy home with full HP. Runs on every Start New
+/// Game — on a first start it is a no-op over fresh state.
+fn reset_session(spec: &CharSpec, players: &mut Query<&mut AnimatedChar>, foes: &mut Query<&mut EnemyChar>) {
+    for mut ac in players.iter_mut() {
+        ac.ctl = Controller::new(spec.spawn);
+        ac.fighter = player_fighter();
+        ac.sand = SandTank::new(SAND_MAX, start_sand());
+        ac.slowmo_t = 0.0;
+        ac.elapsed = 0.0;
+        ac.slowmo_staged = false;
+        ac.time = 0.0;
+        ac.air_time = 0.0;
+        ac.hang_time = 0.0;
+        ac.pole_time = 0.0;
+        ac.checkpoint = seed_checkpoint();
+        ac.orbit_yaw = 0.0;
+        ac.orbit_pitch = 0.25;
+    }
+    for mut ec in foes.iter_mut() {
+        ec.ctl = Controller::new(ec.home);
+        ec.fighter = enemy_fighter();
+        ec.dead_time = 0.0;
+        ec.sand_paid = false;
+        ec.time = 0.0;
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_menu_action(
+    action: MenuAction,
+    commands: &mut Commands,
+    phase: &mut Phase,
+    state: &mut MenuState,
+    settings: &mut Settings,
+    audio_handles: Option<&AudioHandles>,
+    music_q: &mut Query<Entity, With<MusicPlayer>>,
+    menu_q: &mut Query<&mut Visibility, (With<MenuEntity>, Without<GameEntity>)>,
+    game_q: &mut Query<&mut Visibility, (With<GameEntity>, Without<MenuEntity>)>,
+    separate_menu: bool,
+    spec: Option<&CharSpec>,
+    players: &mut Query<&mut AnimatedChar>,
+    foes: &mut Query<&mut EnemyChar>,
+    exit: &mut EventWriter<AppExit>,
+) {
+    match action {
+        MenuAction::StartGame => {
+            if !state.has_char {
+                println!("[t2t] menu: no playable sector loaded (start ignored)");
+                state.auto_secs = None;
+                return;
+            }
+            println!("[t2t] menu -> playing");
+            if let Some(spec) = spec {
+                reset_session(spec, players, foes);
+            }
+            if let Some(h) = audio_handles {
+                for e in music_q.iter() {
+                    commands.entity(e).despawn();
+                }
+                commands.spawn((AudioPlayer(h.ui_confirm.clone()), PlaybackSettings::ONCE));
+                println!("[t2t] audio: music stopped, confirm sound (event 0x190007)");
+            }
+            for mut v in menu_q.iter_mut() {
+                *v = Visibility::Hidden;
+            }
+            for mut v in game_q.iter_mut() {
+                *v = Visibility::Visible;
+            }
+            state.stack.clear();
+            *phase = Phase::Playing;
+        }
+        MenuAction::ToScreen(screen) => {
+            state.stack.push(state.screen);
+            state.screen = screen;
+            state.selected = 0;
+        }
+        MenuAction::Back => {
+            if let Some(prev) = state.stack.pop() {
+                state.screen = prev;
+            } else if state.screen == MenuScreen::Pause {
+                state.stack.clear();
+                *phase = Phase::Playing;
+            } else {
+                state.screen = MenuScreen::Main;
+            }
+            state.selected = 0;
+        }
+        MenuAction::Resume => {
+            state.stack.clear();
+            *phase = Phase::Playing;
+        }
+        MenuAction::QuitToMenu => {
+            println!("[t2t] game -> menu");
+            if separate_menu {
+                for mut v in game_q.iter_mut() {
+                    *v = Visibility::Hidden;
+                }
+            }
+            for mut v in menu_q.iter_mut() {
+                *v = Visibility::Inherited;
+            }
+            if settings.music_on {
+                if let Some(h) = audio_handles {
+                    commands.spawn((AudioPlayer(h.music.clone()), PlaybackSettings::LOOP));
+                    println!("[t2t] audio: menu music restarted");
+                }
+            }
+            state.screen = MenuScreen::Main;
+            state.stack.clear();
+            state.selected = 0;
+            *phase = Phase::Menu;
+        }
+        MenuAction::QuitApp => {
+            println!("[t2t] menu: quit confirmed");
+            exit.write(AppExit::Success);
+        }
+        MenuAction::ToggleMusic => {
+            settings.music_on = !settings.music_on;
+            if settings.music_on {
+                if let Some(h) = audio_handles {
+                    commands.spawn((AudioPlayer(h.music.clone()), PlaybackSettings::LOOP));
+                }
+                println!("[t2t] settings: music on");
+            } else {
+                for e in music_q.iter() {
+                    commands.entity(e).despawn();
+                }
+                println!("[t2t] settings: music off");
+            }
+        }
+        MenuAction::ToggleInterface => {
+            settings.interface_on = !settings.interface_on;
+            println!("[t2t] settings: interface {}", settings.interface_on);
+        }
+        MenuAction::PlayCredits => {
+            // The Cine player picks this up next frame
+            // (and reports a missing credits clip itself).
+            commands.insert_resource(CreditsRequest);
+            println!("[t2t] menu: credits requested");
+        }
+        MenuAction::Noop => {}
+    }
+}
+
+fn menu_navigate(state: &mut MenuState, len: usize, down: bool, up: bool) {
+    if len == 0 {
+        return;
+    }
+    if down {
+        state.selected = (state.selected + 1) % len;
+    }
+    if up {
+        state.selected = (state.selected + len - 1) % len;
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn menu_nav(
+    mut commands: Commands,
+    keys: Res<ButtonInput<KeyCode>>,
+    mut phase: ResMut<Phase>,
+    mut state: ResMut<MenuState>,
+    mut settings: ResMut<Settings>,
+    strings: Res<MenuStrings>,
+    audio_handles: Option<Res<AudioHandles>>,
+    mut music_q: Query<Entity, With<MusicPlayer>>,
+    mut menu_q: Query<&mut Visibility, (With<MenuEntity>, Without<GameEntity>)>,
+    mut game_q: Query<&mut Visibility, (With<GameEntity>, Without<MenuEntity>)>,
+    menu_world: Option<Res<MenuWorld>>,
+    spec: Option<Res<CharSpec>>,
+    mut players: Query<&mut AnimatedChar>,
+    mut foes: Query<&mut EnemyChar>,
+    mut exit: EventWriter<AppExit>,
+    intro: Option<Res<IntroState>>,
+) {
+    // Auto-start (staging) bypasses navigation.
+    if let Some(s) = state.auto_secs {
+        if state.t >= s {
             state.auto_secs = None;
+            let separate = menu_world
+                .as_deref()
+                .map_or(false, |m| m.0.is_some());
+            apply_menu_action(
+                MenuAction::StartGame,
+                &mut commands,
+                &mut phase,
+                &mut state,
+                &mut settings,
+                audio_handles.as_deref(),
+                &mut music_q,
+                &mut menu_q,
+                &mut game_q,
+                separate,
+                spec.as_deref(),
+                &mut players,
+                &mut foes,
+                &mut exit,
+            );
             return;
         }
-        println!("[t2t] menu -> playing");
-        // Stop the menu music; play the confirm sound.
-        if let Some(h) = audio_handles {
-            for e in &music_q {
-                commands.entity(e).despawn();
+    }
+    // While the boot intro plays, Enter/Space belong to
+    // it (skip), not to menu navigation.
+    if intro.as_ref().map_or(false, |i| i.active) {
+        return;
+    }
+    let items = menu_items(state.screen, &strings, &settings);
+    if keys.just_pressed(KeyCode::ArrowDown) || keys.just_pressed(KeyCode::KeyS) {
+        menu_navigate(&mut state, items.len(), true, false);
+    }
+    if keys.just_pressed(KeyCode::ArrowUp) || keys.just_pressed(KeyCode::KeyW) {
+        menu_navigate(&mut state, items.len(), false, true);
+    }
+    if keys.just_pressed(KeyCode::Enter) {
+        if let Some(item) = items.get(state.selected) {
+            let action = item.action;
+            let separate = menu_world
+                .as_deref()
+                .map_or(false, |m| m.0.is_some());
+            apply_menu_action(
+                action,
+                &mut commands,
+                &mut phase,
+                &mut state,
+                &mut settings,
+                audio_handles.as_deref(),
+                &mut music_q,
+                &mut menu_q,
+                &mut game_q,
+                separate,
+                spec.as_deref(),
+                &mut players,
+                &mut foes,
+                &mut exit,
+            );
+        }
+    }
+    if keys.just_pressed(KeyCode::Escape) {
+        let action = if state.screen == MenuScreen::Main {
+            MenuAction::ToScreen(MenuScreen::ConfirmQuit)
+        } else {
+            MenuAction::Back
+        };
+        let separate = menu_world
+            .as_deref()
+            .map_or(false, |m| m.0.is_some());
+        apply_menu_action(
+            action,
+            &mut commands,
+            &mut phase,
+            &mut state,
+            &mut settings,
+            audio_handles.as_deref(),
+            &mut music_q,
+            &mut menu_q,
+            &mut game_q,
+            separate,
+            spec.as_deref(),
+            &mut players,
+            &mut foes,
+            &mut exit,
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn pause_nav(
+    mut commands: Commands,
+    keys: Res<ButtonInput<KeyCode>>,
+    mut phase: ResMut<Phase>,
+    mut state: ResMut<MenuState>,
+    mut settings: ResMut<Settings>,
+    strings: Res<MenuStrings>,
+    audio_handles: Option<Res<AudioHandles>>,
+    mut music_q: Query<Entity, With<MusicPlayer>>,
+    mut menu_q: Query<&mut Visibility, (With<MenuEntity>, Without<GameEntity>)>,
+    mut game_q: Query<&mut Visibility, (With<GameEntity>, Without<MenuEntity>)>,
+    menu_world: Option<Res<MenuWorld>>,
+    spec: Option<Res<CharSpec>>,
+    mut players: Query<&mut AnimatedChar>,
+    mut foes: Query<&mut EnemyChar>,
+    mut exit: EventWriter<AppExit>,
+) {
+    let items = menu_items(state.screen, &strings, &settings);
+    if keys.just_pressed(KeyCode::ArrowDown) || keys.just_pressed(KeyCode::KeyS) {
+        menu_navigate(&mut state, items.len(), true, false);
+    }
+    if keys.just_pressed(KeyCode::ArrowUp) || keys.just_pressed(KeyCode::KeyW) {
+        menu_navigate(&mut state, items.len(), false, true);
+    }
+    if keys.just_pressed(KeyCode::Enter) {
+        if let Some(item) = items.get(state.selected) {
+            let action = item.action;
+            let separate = menu_world
+                .as_deref()
+                .map_or(false, |m| m.0.is_some());
+            apply_menu_action(
+                action,
+                &mut commands,
+                &mut phase,
+                &mut state,
+                &mut settings,
+                audio_handles.as_deref(),
+                &mut music_q,
+                &mut menu_q,
+                &mut game_q,
+                separate,
+                spec.as_deref(),
+                &mut players,
+                &mut foes,
+                &mut exit,
+            );
+        }
+    }
+    if keys.just_pressed(KeyCode::Escape) {
+        let action = if state.screen == MenuScreen::Pause {
+            MenuAction::Resume
+        } else {
+            MenuAction::Back
+        };
+        let separate = menu_world
+            .as_deref()
+            .map_or(false, |m| m.0.is_some());
+        apply_menu_action(
+            action,
+            &mut commands,
+            &mut phase,
+            &mut state,
+            &mut settings,
+            audio_handles.as_deref(),
+            &mut music_q,
+            &mut menu_q,
+            &mut game_q,
+            separate,
+            spec.as_deref(),
+            &mut players,
+            &mut foes,
+            &mut exit,
+        );
+    }
+}
+
+fn pause_toggle(
+    keys: Res<ButtonInput<KeyCode>>,
+    mut phase: ResMut<Phase>,
+    mut state: ResMut<MenuState>,
+) {
+    if keys.just_pressed(KeyCode::Escape) {
+        state.screen = MenuScreen::Pause;
+        state.stack.clear();
+        state.selected = 0;
+        *phase = Phase::Paused;
+        println!("[t2t] game paused");
+    }
+}
+
+fn pause_ui_visibility(
+    phase: Res<Phase>,
+    mut q: Query<&mut Visibility, With<PauseUi>>,
+) {
+    let vis = if *phase == Phase::Paused {
+        Visibility::Visible
+    } else {
+        Visibility::Hidden
+    };
+    for mut v in &mut q {
+        *v = vis;
+    }
+}
+
+/// Rebuild the menu (or pause) item list whenever the
+/// screen, selection, or a toggle value changes.
+fn menu_list_system(
+    mut commands: Commands,
+    phase: Res<Phase>,
+    mut state: ResMut<MenuState>,
+    strings: Res<MenuStrings>,
+    settings: Res<Settings>,
+    menu_lists: Query<Entity, With<MenuList>>,
+    pause_lists: Query<Entity, With<PauseList>>,
+    all_children: Query<&Children>,
+    // One query for both info nodes (menu + pause): two
+    // &mut Text queries conflict at runtime (B0001). Both
+    // nodes get the phase-appropriate string; the hidden
+    // one is corrected on the frame its phase opens.
+    mut info_q: Query<&mut Text, Or<(With<MenuInfo>, With<PauseInfo>)>>,
+) {
+    let key = (
+        state.screen,
+        state.selected,
+        settings.music_on,
+        settings.interface_on,
+    );
+    let in_menu = *phase == Phase::Menu;
+    let built = if in_menu {
+        &mut state.built
+    } else {
+        &mut state.pause_built
+    };
+    if *built == Some(key) {
+        return;
+    }
+    *built = Some(key);
+    let items = menu_items(state.screen, &strings, &settings);
+    let (title, info) = menu_screen_text(state.screen, &strings);
+    // NOTE: a childless container has NO Children component,
+    // so the list entity must be queried without &Children
+    // (the first build found nothing and the menu stayed
+    // empty — the old query never matched).
+    let list_e = if in_menu {
+        menu_lists.single().ok()
+    } else {
+        pause_lists.single().ok()
+    };
+    let list_data: Option<(Entity, Vec<Entity>)> = list_e.map(|e| {
+        let children = all_children
+            .get(e)
+            .map(|ch| ch.iter().collect())
+            .unwrap_or_default();
+        (e, children)
+    });
+    let info_value = if in_menu {
+        if title.is_empty() {
+            info.clone()
+        } else if info.is_empty() {
+            title.clone()
+        } else {
+            format!("{title}\n{info}")
+        }
+    } else if state.screen == MenuScreen::Pause {
+        // The pause root already titles itself "Paused".
+        String::new()
+    } else if info.is_empty() {
+        title.clone()
+    } else {
+        format!("{title}\n{info}")
+    };
+    for mut text in &mut info_q {
+        **text = info_value.clone();
+    }
+    if let Some((list_e, children)) = list_data {
+        for child in children {
+            commands.entity(child).despawn();
+        }
+        let selected = state.selected;
+        commands.entity(list_e).with_children(|p| {
+            for (i, item) in items.iter().enumerate() {
+                p.spawn((
+                    Text::new(item.label.clone()),
+                    TextFont {
+                        font_size: 22.0,
+                        ..default()
+                    },
+                    TextColor(if i == selected {
+                        Color::srgb(0.92, 0.85, 0.68)
+                    } else {
+                        Color::srgb(0.72, 0.72, 0.76)
+                    }),
+                ));
             }
-            commands.spawn((AudioPlayer(h.ui_confirm.clone()), PlaybackSettings::ONCE));
-            println!("[t2t] audio: music stopped, confirm sound (event 0x190007)");
-        }
-        for mut v in &mut menu_q {
-            *v = Visibility::Hidden;
-        }
-        for mut v in &mut game_q {
-            *v = Visibility::Visible;
-        }
-        *phase = Phase::Playing;
+        });
     }
 }
 
@@ -2437,6 +4004,7 @@ fn main() {
     }
     let mut have_char = false;
     if let Some(world) = prepare_world(&bf_path, &wow_name) {
+        app.insert_resource(Portals(load_portals(&bf_path, &wow_name)));
         if let Some(spec) = prepare_character(&bf_path, &wow_name, &world) {
             app.insert_resource(spec);
             have_char = true;
@@ -2450,23 +4018,55 @@ fn main() {
     // otherwise; the Menu3D world is the backdrop (when
     // the game sector IS Menu3D it doubles as both).
     let start_playing = std::env::var("T2T_START").map_or(false, |v| v == "play");
+    // Staging: T2T_START_PAUSED=1 boots into gameplay
+    // with the pause overlay open (verifies the panel
+    // without key injection).
+    let start_paused = std::env::var("T2T_START_PAUSED").map_or(false, |v| v == "1");
     app.insert_resource(if start_playing {
         Phase::Playing
+    } else if start_paused {
+        Phase::Paused
     } else {
         Phase::Menu
     });
+    app.insert_resource(load_menu_strings(&bf_path));
+    app.insert_resource(Settings::default());
     let menu_world = if wow_name.contains("Menu3D") {
         None
     } else {
         prepare_world(&bf_path, "Menu3D")
     };
     app.insert_resource(MenuWorld(menu_world));
+    // Staging: T2T_MENU_SCREEN=<name> boots the menu on
+    // that screen (main/options/graphics/sounds/controls/
+    // game/profiles/load/credits/confirm).
+    let boot_screen = if start_paused {
+        MenuScreen::Pause
+    } else {
+        match std::env::var("T2T_MENU_SCREEN").as_deref() {
+            Ok("options") => MenuScreen::Options,
+            Ok("graphics") => MenuScreen::Graphics,
+            Ok("sounds") => MenuScreen::Sounds,
+            Ok("controls") => MenuScreen::Controls,
+            Ok("game") => MenuScreen::GameOpts,
+            Ok("profiles") => MenuScreen::Profiles,
+            Ok("load") => MenuScreen::LoadGame,
+            Ok("credits") => MenuScreen::Credits,
+            Ok("confirm") => MenuScreen::ConfirmQuit,
+            _ => MenuScreen::Main,
+        }
+    };
     app.insert_resource(MenuState {
         t: 0.0,
         auto_secs: std::env::var("T2T_MENU_SECS")
             .ok()
             .and_then(|v| v.parse::<f32>().ok()),
         has_char: have_char,
+        screen: boot_screen,
+        stack: Vec::new(),
+        selected: 0,
+        built: None,
+        pause_built: None,
     });
     // M7 audio (optional: absence only silences the game).
     match prepare_audio(&bf_path) {
@@ -2476,15 +4076,37 @@ fn main() {
         None => eprintln!("[t2t] audio unavailable (Sound/ data not decoded) — continuing silent"),
     }
     // M7 boot intro (optional: absence boots to menu).
-    if let Some(st) = prepare_intro(start_playing) {
+    // Booting paused also skips the intro: its overlay
+    // would otherwise cover the screen while no system
+    // advances it (intro_update only runs in Menu).
+    if let Some(st) = prepare_intro(start_playing || start_paused) {
         app.insert_resource(st);
+    }
+    // Cine story clips + credits clip (optional:
+    // absence runs with no Cine).
+    if let Some(st) = prepare_cine() {
+        app.insert_resource(st);
+    }
+    // Staging: play the credits clip at boot (the menu
+    // item requests it the same way at runtime).
+    if std::env::var_os("T2T_PLAY_CREDITS").is_some() {
+        app.insert_resource(CreditsRequest);
     }
 
     app.add_systems(Startup, setup);
     app.add_systems(Update, intro_update.run_if(in_menu));
+    app.add_systems(Update, cine_trigger);
+    app.add_systems(Update, cine_update.run_if(in_cine));
     app.add_systems(Update, menu_update.run_if(in_menu));
+    app.add_systems(Update, menu_nav.run_if(in_menu));
+    app.add_systems(Update, menu_list_system.run_if(in_menu_or_paused));
+    app.add_systems(Update, pause_toggle.run_if(in_playing));
+    app.add_systems(Update, pause_nav.run_if(in_paused));
+    app.add_systems(Update, pause_ui_visibility);
+    app.add_systems(Update, hud_system.run_if(in_playing));
     if have_char {
         app.add_systems(Update, animate_char.run_if(in_playing));
+        app.add_systems(Update, portal_watch.run_if(in_playing));
     }
     app.run();
 }
